@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+TEST_TMP=$(mktemp --directory)
+
+cleanup_tests() {
+    rm -rf -- "$TEST_TMP"
+}
+trap cleanup_tests EXIT
+
+fail() {
+    printf 'FAIL: %s\n' "$*" >&2
+    exit 1
+}
+
+assert_file_contains() {
+    local file=$1
+    local expected=$2
+
+    grep --fixed-strings --quiet -- "$expected" "$file" || \
+        fail "$file does not contain: $expected"
+}
+
+printf 'Checking Bash syntax...\n'
+bash -n \
+    "$PROJECT_DIR/archive-disk.sh" \
+    "$PROJECT_DIR/extract-metadata.sh" \
+    "$PROJECT_DIR/lib/common.sh"
+
+printf 'Checking help and dry-run behavior...\n'
+bash "$PROJECT_DIR/archive-disk.sh" --help >/dev/null
+bash "$PROJECT_DIR/extract-metadata.sh" --help >/dev/null
+touch "$TEST_TMP/fixture.img"
+bash "$PROJECT_DIR/archive-disk.sh" \
+    --pc-id PC-TEST \
+    --output "$TEST_TMP/archive-output" \
+    --target /dev/test-disk \
+    --dry-run > "$TEST_TMP/archive-dry-run.txt" 2>&1
+[[ ! -e $TEST_TMP/archive-output ]] || fail "archive dry run created its output directory"
+assert_file_contains "$TEST_TMP/archive-dry-run.txt" "ddrescue image:"
+
+bash "$PROJECT_DIR/extract-metadata.sh" \
+    --pc-id PC-TEST \
+    --root "$TEST_TMP/metadata-output" \
+    --image "$TEST_TMP/fixture.img" \
+    --dry-run > "$TEST_TMP/metadata-dry-run.txt"
+[[ ! -e $TEST_TMP/metadata-output ]] || fail "metadata dry run created its output directory"
+assert_file_contains "$TEST_TMP/metadata-dry-run.txt" "read-only guestmount mounts"
+
+printf 'Checking shared command records and README blocks...\n'
+# shellcheck source=../lib/common.sh
+source "$PROJECT_DIR/lib/common.sh"
+COMMANDS_JSONL="$TEST_TMP/commands.jsonl"
+RECORD_ROOT="$TEST_TMP"
+run_recorded_command fixture_command \
+    "$TEST_TMP/stdout.txt" "$TEST_TMP/stderr.txt" \
+    printf '%s\n' fixture
+jq --exit-status '
+    .name == "fixture_command"
+    and .exit_code == 0
+    and .stdout == "stdout.txt"
+    and .timezone == "America/New_York"
+    and (.started_at | test("-0[45]:00$"))
+    and (.completed_at | test("-0[45]:00$"))
+' "$COMMANDS_JSONL" >/dev/null || fail "command record is invalid"
+
+printf '# Fixture\n\nManual text.\n' > "$TEST_TMP/README.md"
+printf 'First generated value.\n' > "$TEST_TMP/block.md"
+update_readme_block "$TEST_TMP/README.md" fixture-owner "$TEST_TMP/block.md"
+printf 'Replacement generated value.\n' > "$TEST_TMP/block.md"
+update_readme_block "$TEST_TMP/README.md" fixture-owner "$TEST_TMP/block.md"
+assert_file_contains "$TEST_TMP/README.md" "Manual text."
+assert_file_contains "$TEST_TMP/README.md" "Replacement generated value."
+if grep --fixed-strings --quiet "First generated value." "$TEST_TMP/README.md"; then
+    fail "managed README block was appended instead of replaced"
+fi
+
+printf 'Checking metadata parsers and guest path containment...\n'
+# shellcheck source=../extract-metadata.sh
+source "$PROJECT_DIR/extract-metadata.sh"
+METADATA_DIR="$TEST_TMP/metadata"
+SESSION_DIR="$TEST_TMP/session"
+WORK_DIR="$TEST_TMP/work"
+LOGS_DIR="$TEST_TMP/logs"
+COMMANDS_JSONL="$TEST_TMP/metadata-commands.jsonl"
+RECORD_ROOT="$METADATA_DIR"
+mkdir -p \
+    "$METADATA_DIR/linux" \
+    "$METADATA_DIR/windows" \
+    "$SESSION_DIR" \
+    "$WORK_DIR" \
+    "$LOGS_DIR" \
+    "$TEST_TMP/guest/etc" \
+    "$TEST_TMP/guest/Users/Alice" \
+    "$TEST_TMP/outside"
+
+cat > "$TEST_TMP/dpkg-status" <<'EOF'
+Package: installed-package
+Status: install ok installed
+Version: 1.2.3
+Architecture: amd64
+
+Package: removed-package
+Status: deinstall ok config-files
+Version: 4.5.6
+Architecture: amd64
+EOF
+parse_dpkg_packages "$TEST_TMP/dpkg-status" > "$TEST_TMP/packages.json"
+jq --exit-status '
+    .package_manager == "dpkg"
+    and (.packages | length) == 1
+    and .packages[0].name == "installed-package"
+' "$TEST_TMP/packages.json" >/dev/null || fail "dpkg parser returned unexpected data"
+
+printf '%s\n' 'psk=keep-out' 'password: keep-out-too' 'address=192.0.2.10' \
+    | redact_network_content > "$TEST_TMP/redacted.txt"
+if grep --fixed-strings --quiet "keep-out" "$TEST_TMP/redacted.txt"; then
+    fail "network secret redaction retained a fixture secret"
+fi
+assert_file_contains "$TEST_TMP/redacted.txt" "address=192.0.2.10"
+
+mkdir -p "$TEST_TMP/guest/etc/NetworkManager/system-connections"
+printf '%s\n' 'psk=a-different-secret' \
+    > "$TEST_TMP/guest/etc/NetworkManager/system-connections/wifi.nmconnection"
+: > "$TEST_TMP/network-records.jsonl"
+REDACT_SECRETS=true
+add_linux_network_file \
+    "$TEST_TMP/guest" \
+    "$TEST_TMP/guest/etc/NetworkManager/system-connections/wifi.nmconnection" \
+    "$TEST_TMP/network-records.jsonl"
+jq --exit-status '.[0].content == "<redacted: sensitive connection file omitted>"' \
+    --slurp "$TEST_TMP/network-records.jsonl" >/dev/null || \
+    fail "sensitive network connection file was not omitted"
+
+ln -s "$TEST_TMP/outside" "$TEST_TMP/guest/etc/escaping-link"
+if safe_existing_guest_path "$TEST_TMP/guest" etc/escaping-link >/dev/null; then
+    fail "guest path containment accepted an escaping symlink"
+fi
+
+cat > "$TEST_TMP/apps.reg" <<'EOF'
+[HKEY_LOCAL_MACHINE\Software\Fixture]
+"DisplayName"="Fixture App"
+"DisplayVersion"="9.0"
+"Publisher"="Fixture Publisher"
+EOF
+: > "$TEST_TMP/apps.tsv"
+parse_windows_applications \
+    "$TEST_TMP/apps.reg" "$METADATA_DIR/windows/applications.json" "$TEST_TMP/apps.tsv"
+parse_windows_applications \
+    "$TEST_TMP/missing.reg" "$METADATA_DIR/windows/applications.json" "$TEST_TMP/apps.tsv"
+jq --exit-status '
+    length == 1
+    and .[0].display_name == "Fixture App"
+' "$METADATA_DIR/windows/applications.json" >/dev/null || \
+    fail "Windows application parser returned unexpected data"
+
+cat > "$TEST_TMP/profiles.reg" <<'EOF'
+[HKEY_LOCAL_MACHINE\Software\ProfileList\S-1-5-21-1000]
+"ProfileImagePath"="C:\\Users\\Alice"
+EOF
+extract_windows_profiles "$TEST_TMP/guest" "$TEST_TMP/profiles.reg"
+jq --exit-status '
+    length == 1
+    and .[0].sid == "S-1-5-21-1000"
+    and .[0].profile_directory_exists == true
+' "$METADATA_DIR/windows/profiles.json" >/dev/null || \
+    fail "Windows profile parser returned unexpected data"
+
+printf 'Checking the archive workflow with command doubles...\n'
+(
+    # Exercise orchestration and reports without reading a physical disk.
+    source "$PROJECT_DIR/archive-disk.sh"
+
+    select_target_disks() {
+        TARGET_DISKS=(/dev/test-disk)
+    }
+
+    validate_runtime() {
+        return 0
+    }
+
+    collect_livecd_information() {
+        return 0
+    }
+
+    collect_hardware_information() {
+        return 0
+    }
+
+    collect_disk_information() {
+        return 0
+    }
+
+    confirm_targets() {
+        return 0
+    }
+
+    check_source_mounts() {
+        return 0
+    }
+
+    check_free_space() {
+        return 0
+    }
+
+    disk_field() {
+        case $2 in
+            SIZE) printf '1024\n' ;;
+            MODEL) printf 'Fixture Disk\n' ;;
+            SERIAL) printf 'FIXTURE-SERIAL\n' ;;
+        esac
+    }
+
+    ddrescue() {
+        local -a arguments=("$@")
+        local argument_count=${#arguments[@]}
+        local raw_image=${arguments[argument_count - 2]}
+        local map_file=${arguments[argument_count - 1]}
+
+        if [[ ! -f $raw_image ]]; then
+            printf 'fixture disk image\n' > "$raw_image"
+        fi
+        touch "$map_file"
+    }
+
+    main \
+        --pc-id PC-ARCHIVE-WORKFLOW \
+        --output "$TEST_TMP/archive-workflow-output" \
+        --target /dev/test-disk \
+        --compress none \
+        --yes
+)
+jq --exit-status '
+    .pc_id == "PC-ARCHIVE-WORKFLOW"
+    and .timezone == "America/New_York"
+    and (.started_at | test("-0[45]:00$"))
+    and (.completed_at | test("-0[45]:00$"))
+    and (.source_disks | length) == 1
+    and .source_disks[0].image == "PC-ARCHIVE-WORKFLOW.img"
+    and .source_disks[0].compressed_sha256_file == null
+    and .source_disks[0].ddrescue_logs == [
+        "logs/ddrescue-pass1.log",
+        "logs/ddrescue-pass2.log"
+    ]
+' "$TEST_TMP/archive-workflow-output/ARCHIVE/PC-ARCHIVE-WORKFLOW.archive.json" >/dev/null || \
+    fail "archive workflow summary returned unexpected data"
+jq --slurp --exit-status '
+    length == 3 and all(.exit_code == 0)
+' "$TEST_TMP/archive-workflow-output/ARCHIVE/commands.jsonl" >/dev/null || \
+    fail "archive workflow command records returned unexpected data"
+
+printf 'Checking the metadata workflow with read-only command doubles...\n'
+(
+    # Exercise the orchestration without requiring root, FUSE, or a real image.
+    source "$PROJECT_DIR/extract-metadata.sh"
+
+    require_root() {
+        return 0
+    }
+
+    require_tool() {
+        return 0
+    }
+
+    guestfish() {
+        printf '/dev/sda1: ext4\n'
+    }
+
+    guestmount() {
+        local mount_dir=${@: -1}
+
+        mkdir -p "$mount_dir/etc" "$mount_dir/var/lib/dpkg"
+        printf '%s\n' 'NAME="Workflow Linux"' 'VERSION_ID="1"' \
+            > "$mount_dir/etc/os-release"
+        printf '%s\n' workflow-host > "$mount_dir/etc/hostname"
+        printf '%s\n' 'root:x:0:0:root:/root:/bin/bash' \
+            > "$mount_dir/etc/passwd"
+        printf '%s\n' 'root:x:0:' > "$mount_dir/etc/group"
+        printf '%s\n' 'UUID=fixture / ext4 defaults 0 1' > "$mount_dir/etc/fstab"
+        printf '%s\n' \
+            'Package: workflow-package' \
+            'Status: install ok installed' \
+            'Version: 1.0' \
+            'Architecture: amd64' \
+            > "$mount_dir/var/lib/dpkg/status"
+    }
+
+    guestunmount() {
+        return 0
+    }
+
+    main \
+        --pc-id PC-WORKFLOW \
+        --root "$TEST_TMP/workflow-output" \
+        --image "$TEST_TMP/fixture.img"
+)
+jq --exit-status '
+    .pc_id == "PC-WORKFLOW"
+    and .timezone == "America/New_York"
+    and (.started_at | test("-0[45]:00$"))
+    and (.completed_at | test("-0[45]:00$"))
+    and .extraction.linux.extracted == true
+    and .extraction.linux.users == 1
+    and .extraction.linux.packages == 1
+' "$TEST_TMP/workflow-output/METADATA/PC-WORKFLOW.metadata.json" >/dev/null || \
+    fail "metadata workflow summary returned unexpected data"
+if find "$TEST_TMP/workflow-output/METADATA/work" \
+    -maxdepth 1 -type d -name 'session.*' -print -quit | grep --quiet .; then
+    fail "metadata workflow retained a temporary session directory"
+fi
+
+printf 'All tests passed.\n'
