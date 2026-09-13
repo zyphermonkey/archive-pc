@@ -58,6 +58,12 @@ printf 'Checking interactive PC ID and output selection...\n'
 (
     source "$PROJECT_DIR/archive-disk.sh"
 
+    output_filesystem_is_system_only tmpfs || \
+        fail "output picker did not exclude a system-only filesystem"
+    if output_filesystem_is_system_only fuseblk; then
+        fail "output picker excluded an external FUSE block filesystem"
+    fi
+
     available_output_paths() {
         printf '%s\n' /mnt/fixture-a /mnt/fixture-b
     }

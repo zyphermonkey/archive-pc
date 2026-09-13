@@ -87,17 +87,48 @@ prompt_for_pc_id() {
     done
 }
 
+output_filesystem_is_system_only() {
+    local filesystem=$1
+
+    case $filesystem in
+        autofs|devpts|devtmpfs|overlay|proc|ramfs|sysfs|tmpfs)
+            return 0
+            ;;
+        bpf|binfmt_misc|cgroup|cgroup2|configfs|debugfs|efivarfs|fusectl)
+            return 0
+            ;;
+        fuse.gvfsd-fuse|fuse.portal|hugetlbfs|mqueue|nsfs|pstore|rpc_pipefs)
+            return 0
+            ;;
+        securityfs|selinuxfs|smackfs|tracefs)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 available_output_paths() {
-    local mount_options
+    local filesystem
     local mount_point
+    local -A seen_paths=()
 
     while IFS= read -r mount_point; do
-        [[ -n $mount_point && $mount_point != / ]] || continue
-        mount_options=$(findmnt --noheadings --output OPTIONS --target "$mount_point" 2>/dev/null || true)
-        if [[ ,$mount_options, == *,rw,* ]]; then
-            printf '%s\n' "$mount_point"
-        fi
-    done < <(findmnt --real --list --noheadings --raw --output TARGET 2>/dev/null)
+        [[ -n $mount_point && $mount_point != / && -d $mount_point ]] || continue
+        [[ -z ${seen_paths[$mount_point]+present} ]] || continue
+
+        filesystem=$(findmnt --noheadings --first-only --output FSTYPE \
+            --mountpoint "$mount_point" 2>/dev/null || true)
+        filesystem=${filesystem//[[:space:]]/}
+        output_filesystem_is_system_only "$filesystem" && continue
+
+        seen_paths[$mount_point]=true
+        printf '%s\n' "$mount_point"
+    done < <(
+        findmnt --json --list --options rw --output TARGET 2>/dev/null |
+            jq --raw-output '.filesystems[]?.target // empty' 2>/dev/null
+    )
 }
 
 print_output_summary() {

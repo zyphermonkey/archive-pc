@@ -46,7 +46,7 @@ All three setup values can be selected interactively:
 sudo ./archive-disk.sh
 ```
 
-When `--pc-id` is omitted, the script prompts for a text identifier. When `--output` is omitted, it displays numbered writable, non-root filesystem mount points, their source and filesystem type, and their available space. The list also provides an option to enter a different parent directory. When neither `--target` nor `--all-internal-disks` is supplied, the script displays the available whole disks and prompts for an integer selection. The disk containing the selected archive output is excluded from the source-disk list when that relationship can be resolved.
+When `--pc-id` is omitted, the script prompts for a text identifier. When `--output` is omitted, it displays numbered writable, non-root filesystem mount points, their source and filesystem type, and their available space. Writable external filesystems mounted through FUSE, such as some NTFS configurations, are included; system-only pseudo-filesystems are excluded. The list also provides an option to enter a different parent directory. When neither `--target` nor `--all-internal-disks` is supplied, the script displays the available whole disks and prompts for an integer selection. The disk containing the selected archive output is excluded from the source-disk list when that relationship can be resolved.
 
 All prompts can instead be supplied as command-line options for repeatable or unattended use:
 
