@@ -42,6 +42,54 @@ bash "$PROJECT_DIR/archive-disk.sh" \
 [[ ! -e $TEST_TMP/archive-output ]] || fail "archive dry run created its output directory"
 assert_file_contains "$TEST_TMP/archive-dry-run.txt" "ddrescue image:"
 
+bash "$PROJECT_DIR/archive-disk.sh" \
+    --pc-id PC-DOCS \
+    --output "$TEST_TMP/documentation-dry-output" \
+    --target /dev/test-disk \
+    --documentation-only \
+    --max-read-gb 2 \
+    --dry-run > "$TEST_TMP/documentation-dry-run.txt" 2>&1
+[[ ! -e $TEST_TMP/documentation-dry-output ]] || \
+    fail "documentation dry run created its output directory"
+assert_file_contains "$TEST_TMP/documentation-dry-run.txt" "Documentation would be generated"
+assert_file_contains "$TEST_TMP/documentation-dry-run.txt" "Capture limit: first 2 GB (2000000000 bytes)"
+
+bash "$PROJECT_DIR/archive-disk.sh" \
+    --pc-id PC-SMALL \
+    --output "$TEST_TMP/fractional-limit-output" \
+    --target /dev/test-disk \
+    --max-read-gb 0.25 \
+    --dry-run > "$TEST_TMP/fractional-limit-dry-run.txt" 2>&1
+assert_file_contains \
+    "$TEST_TMP/fractional-limit-dry-run.txt" \
+    "Capture limit: first 0.25 GB (250000000 bytes)"
+assert_file_contains \
+    "$TEST_TMP/fractional-limit-dry-run.txt" \
+    "PC-SMALL.first-0.25GB.img"
+
+if bash "$PROJECT_DIR/archive-disk.sh" \
+    --pc-id PC-TEST \
+    --output "$TEST_TMP/invalid-limit-output" \
+    --target /dev/test-disk \
+    --max-read-gb 0 \
+    --dry-run >/dev/null 2>&1; then
+    fail "archive dry run accepted a zero capture limit"
+fi
+
+(
+    source "$PROJECT_DIR/archive-disk.sh"
+    MAX_READ_BYTES=250000000
+    blockdev() {
+        case $1 in
+            --getsize64) printf '1000000000\n' ;;
+            --getss) printf '512\n' ;;
+        esac
+    }
+    aligned_bytes=$(capture_byte_count /dev/test-disk)
+    [[ $aligned_bytes == 249999872 ]] || \
+        fail "capture limit was not aligned to the disk sector size"
+)
+
 bash "$PROJECT_DIR/extract-metadata.sh" \
     --pc-id PC-TEST \
     --root "$TEST_TMP/metadata-output" \
@@ -206,9 +254,13 @@ printf 'Checking the archive workflow with command doubles...\n'
         return 0
     }
 
+    capture_byte_count() {
+        printf '1000000000\n'
+    }
+
     disk_field() {
         case $2 in
-            SIZE) printf '1024\n' ;;
+            SIZE) printf '2000000000\n' ;;
             MODEL) printf 'Fixture Disk\n' ;;
             SERIAL) printf 'FIXTURE-SERIAL\n' ;;
         esac
@@ -219,6 +271,16 @@ printf 'Checking the archive workflow with command doubles...\n'
         local argument_count=${#arguments[@]}
         local raw_image=${arguments[argument_count - 2]}
         local map_file=${arguments[argument_count - 1]}
+        local argument
+        local size_argument_found=false
+
+        for argument in "${arguments[@]}"; do
+            if [[ $argument == --size=1000000000 ]]; then
+                size_argument_found=true
+                break
+            fi
+        done
+        [[ $size_argument_found == true ]] || fail "limited ddrescue command omitted its byte limit"
 
         if [[ ! -f $raw_image ]]; then
             printf 'fixture disk image\n' > "$raw_image"
@@ -230,16 +292,21 @@ printf 'Checking the archive workflow with command doubles...\n'
         --pc-id PC-ARCHIVE-WORKFLOW \
         --output "$TEST_TMP/archive-workflow-output" \
         --target /dev/test-disk \
+        --max-read-gb 1 \
         --compress none \
         --yes
 )
 jq --exit-status '
     .pc_id == "PC-ARCHIVE-WORKFLOW"
     and .timezone == "America/New_York"
+    and .run.mode == "limited_capture"
+    and .run.requested_limit_bytes == 1000000000
     and (.started_at | test("-0[45]:00$"))
     and (.completed_at | test("-0[45]:00$"))
     and (.source_disks | length) == 1
-    and .source_disks[0].image == "PC-ARCHIVE-WORKFLOW.img"
+    and .source_disks[0].image == "PC-ARCHIVE-WORKFLOW.first-1GB.img"
+    and .source_disks[0].capture.mode == "limited"
+    and .source_disks[0].capture.rescue_domain_bytes == 1000000000
     and .source_disks[0].compressed_sha256_file == null
     and .source_disks[0].ddrescue_logs == [
         "logs/ddrescue-pass1.log",
@@ -251,6 +318,69 @@ jq --slurp --exit-status '
     length == 3 and all(.exit_code == 0)
 ' "$TEST_TMP/archive-workflow-output/ARCHIVE/commands.jsonl" >/dev/null || \
     fail "archive workflow command records returned unexpected data"
+
+printf 'Checking the documentation-only archive workflow...\n'
+(
+    source "$PROJECT_DIR/archive-disk.sh"
+
+    select_target_disks() {
+        TARGET_DISKS=(/dev/documented-disk)
+    }
+
+    validate_runtime() {
+        return 0
+    }
+
+    collect_livecd_information() {
+        return 0
+    }
+
+    collect_hardware_information() {
+        return 0
+    }
+
+    collect_disk_information() {
+        return 0
+    }
+
+    disk_field() {
+        case $2 in
+            SIZE) printf '4000000000\n' ;;
+            MODEL) printf 'Documentation Fixture Disk\n' ;;
+            SERIAL) printf 'DOCS-SERIAL\n' ;;
+        esac
+    }
+
+    ddrescue() {
+        fail "documentation-only mode invoked ddrescue"
+    }
+
+    main \
+        --pc-id PC-DOCUMENTATION \
+        --output "$TEST_TMP/documentation-output" \
+        --target /dev/documented-disk \
+        --documentation-only \
+        --max-read-gb 2
+)
+jq --exit-status '
+    .run.mode == "documentation_only"
+    and .run.requested_limit_bytes == 2000000000
+    and (.source_disks | length) == 1
+    and .source_disks[0].capture_status == "not_run"
+    and .source_disks[0].capture.mode == "documentation_only"
+    and .source_disks[0].capture.requested_limit_bytes == 2000000000
+    and .source_disks[0].capture.rescue_domain_bytes == 0
+    and .source_disks[0].image == null
+' "$TEST_TMP/documentation-output/ARCHIVE/PC-DOCUMENTATION.archive.json" >/dev/null || \
+    fail "documentation-only summary returned unexpected data"
+if find "$TEST_TMP/documentation-output/ARCHIVE" -maxdepth 1 \
+    \( -name '*.img' -o -name '*.zst' -o -name '*.sha256' -o -name '*.map' \) \
+    -print -quit | grep --quiet .; then
+    fail "documentation-only mode created an image-related file"
+fi
+assert_file_contains \
+    "$TEST_TMP/documentation-output/ARCHIVE/README.md" \
+    "No image files were created."
 
 printf 'Checking the metadata workflow with read-only command doubles...\n'
 (

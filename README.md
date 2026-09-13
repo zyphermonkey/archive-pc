@@ -72,6 +72,35 @@ The default keeps both the raw and compressed images. Add `--remove-raw-after-co
 
 `--all-internal-disks` selects all non-removable whole disks except the resolved output disk. Explicit `--target` selection is easier to audit and is recommended when only one disk is being archived.
 
+### Documentation-only runs
+
+Use `--documentation-only` (or its shorter alias, `--docs-only`) to generate the archive directory, machine and disk inventory, command records, JSON summary, and README files without invoking ddrescue, hashing, or compression:
+
+```bash
+sudo ./archive-disk.sh \
+  --pc-id PC-001-DEMO \
+  --output /mnt/archive/PC-001-DEMO \
+  --target /dev/disk/by-id/ata-example \
+  --documentation-only
+```
+
+This mode writes documentation, unlike `--dry-run`, which only prints a plan and does not create anything. It does not require root when the output directory is writable, although privileged inventory commands such as `dmidecode`, `smartctl`, and `blkid` may then be recorded as unavailable. The structured summary records `run.mode` as `documentation_only`, and every selected disk records `capture_status` as `not_run`.
+
+### Limited validation captures
+
+Use `--max-read-gb NUMBER` to capture only the requested number of decimal gigabytes from the beginning of each selected disk. One GB is exactly 1,000,000,000 bytes. Up to nine decimal places are accepted, so `--max-read-gb 0.25` captures the first 250,000,000 bytes. Limited images include the range in their names so they cannot be mistaken for full images:
+
+```bash
+sudo ./archive-disk.sh \
+  --pc-id PC-001-TEST \
+  --output /mnt/archive/PC-001-TEST \
+  --target /dev/disk/by-id/ata-example \
+  --max-read-gb 2 \
+  --compress none
+```
+
+This example creates `PC-001-TEST.first-2GB.img`, its ddrescue map, checksum, logs, and documentation. The byte limit is passed to both ddrescue passes and is recorded in the JSON summary. If necessary, the effective capture range is rounded down to the source disk's logical sector size; both the requested and effective byte counts remain documented. Compression and raw-image retention options work normally with limited captures.
+
 ## Extract metadata
 
 Keeping the raw image makes this step faster. When a compressed image is supplied, the script prefers the corresponding `.img` file if it exists. Otherwise it checks the zstd frame's decompressed size against available space and creates a temporary raw image under `METADATA/work/`.

@@ -15,6 +15,9 @@ COMPRESSION="zstd"
 REMOVE_RAW=false
 RETRY_COUNT=3
 ASSUME_YES=false
+DOCUMENTATION_ONLY=false
+MAX_READ_GB=""
+MAX_READ_BYTES=""
 
 ARCHIVE_DIR=""
 LOGS_DIR=""
@@ -43,6 +46,8 @@ Options:
   --keep-raw                      Keep raw images after compression (default)
   --remove-raw-after-compress     Delete raw images after verified compression
   --retry-count N                 ddrescue retry passes (default: 3)
+  --documentation-only            Generate records and documentation; do not image
+  --max-read-gb NUMBER            Capture the first decimal GB amount of each disk
   --dry-run                       Describe actions without writing or imaging
   --yes                           Skip the interactive confirmation
   --debug                         Enable debug logging
@@ -95,6 +100,15 @@ parse_arguments() {
                 RETRY_COUNT=$2
                 shift 2
                 ;;
+            --documentation-only|--docs-only)
+                DOCUMENTATION_ONLY=true
+                shift
+                ;;
+            --max-read-gb)
+                (($# >= 2)) || die "--max-read-gb requires a value."
+                MAX_READ_GB=$2
+                shift 2
+                ;;
             --dry-run)
                 DRY_RUN=true
                 shift
@@ -119,6 +133,9 @@ parse_arguments() {
 }
 
 validate_arguments() {
+    local whole_gb
+    local fractional_gb
+
     [[ -n $PC_ID ]] || die "--pc-id is required."
     [[ $PC_ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
         die "--pc-id may contain only letters, numbers, dots, underscores, and hyphens."
@@ -127,6 +144,20 @@ validate_arguments() {
     [[ $COMPRESSION == none || $COMPRESSION == zstd ]] || \
         die "--compress must be 'none' or 'zstd'."
     [[ $RETRY_COUNT =~ ^[0-9]+$ ]] || die "--retry-count must be a non-negative integer."
+    if [[ -n $MAX_READ_GB ]]; then
+        [[ $MAX_READ_GB =~ ^(0|[1-9][0-9]*)(\.[0-9]{1,9})?$ ]] || \
+            die "--max-read-gb must be a positive number with no more than nine decimal places."
+        whole_gb=${MAX_READ_GB%%.*}
+        ((${#whole_gb} <= 10)) || die "--max-read-gb is too large."
+        ((10#$whole_gb <= 9000000000)) || die "--max-read-gb is too large."
+        fractional_gb=0
+        if [[ $MAX_READ_GB == *.* ]]; then
+            fractional_gb=${MAX_READ_GB#*.}000000000
+            fractional_gb=${fractional_gb:0:9}
+        fi
+        MAX_READ_BYTES=$((10#$whole_gb * 1000000000 + 10#$fractional_gb))
+        ((MAX_READ_BYTES > 0)) || die "--max-read-gb must be greater than zero."
+    fi
 
     if [[ -n $TARGET_DISK && $ALL_INTERNAL_DISKS == true ]]; then
         die "Use either --target or --all-internal-disks, not both."
@@ -136,6 +167,9 @@ validate_arguments() {
     fi
     if [[ $REMOVE_RAW == true && $COMPRESSION == none ]]; then
         die "--remove-raw-after-compress requires --compress zstd."
+    fi
+    if [[ $DOCUMENTATION_ONLY == true && $REMOVE_RAW == true ]]; then
+        die "--remove-raw-after-compress cannot be used with --documentation-only."
     fi
 
     OUTPUT_ROOT=$(realpath --canonicalize-missing -- "$OUTPUT_ROOT")
@@ -226,12 +260,19 @@ select_target_disks() {
 
 image_base_for_disk() {
     local disk=$1
+    local image_base
 
     if ((${#TARGET_DISKS[@]} == 1)); then
-        printf '%s\n' "$PC_ID"
+        image_base=$PC_ID
     else
-        printf '%s-%s\n' "$PC_ID" "$(basename -- "$disk")"
+        image_base="$PC_ID-$(basename -- "$disk")"
     fi
+
+    if [[ -n $MAX_READ_GB ]]; then
+        image_base+=".first-${MAX_READ_GB}GB"
+    fi
+
+    printf '%s\n' "$image_base"
 }
 
 log_suffix_for_disk() {
@@ -251,9 +292,21 @@ show_dry_run() {
     printf 'Dry-run archive plan\n'
     printf '  PC ID: %s\n' "$PC_ID"
     printf '  Output root: %s\n' "$OUTPUT_ROOT"
-    printf '  Compression: %s\n' "$COMPRESSION"
-    printf '  Remove raw after verified compression: %s\n' "$REMOVE_RAW"
-    printf '  Retry count: %s\n' "$RETRY_COUNT"
+    printf '  Documentation only: %s\n' "$DOCUMENTATION_ONLY"
+    if [[ $DOCUMENTATION_ONLY == true ]]; then
+        printf '  Compression: not applicable\n'
+    else
+        printf '  Compression: %s\n' "$COMPRESSION"
+    fi
+    if [[ -n $MAX_READ_GB ]]; then
+        printf '  Capture limit: first %s GB (%s bytes)\n' "$MAX_READ_GB" "$MAX_READ_BYTES"
+    else
+        printf '  Capture limit: full disk\n'
+    fi
+    if [[ $DOCUMENTATION_ONLY == false ]]; then
+        printf '  Remove raw after verified compression: %s\n' "$REMOVE_RAW"
+        printf '  Retry count: %s\n' "$RETRY_COUNT"
+    fi
     printf '  Directories that would be created:\n'
     printf '    %s\n' \
         "$OUTPUT_ROOT/ARCHIVE/logs" \
@@ -264,6 +317,10 @@ show_dry_run() {
     for disk in "${TARGET_DISKS[@]}"; do
         image_base=$(image_base_for_disk "$disk")
         printf '  Source disk: %s\n' "$disk"
+        if [[ $DOCUMENTATION_ONLY == true ]]; then
+            printf '    Documentation would be generated; ddrescue, hashing, and compression would not run.\n'
+            continue
+        fi
         printf '    ddrescue image: %s/ARCHIVE/%s.img\n' "$OUTPUT_ROOT" "$image_base"
         printf '    ddrescue map: %s/ARCHIVE/%s.ddrescue.map\n' "$OUTPUT_ROOT" "$image_base"
         printf '    raw hash: %s/ARCHIVE/%s.img.raw.sha256\n' "$OUTPUT_ROOT" "$image_base"
@@ -273,9 +330,13 @@ show_dry_run() {
         fi
     done
 
-    printf '  Commands would include: inventory collection, two ddrescue passes, SHA256 hashing'
-    if [[ $COMPRESSION == zstd ]]; then
-        printf ', zstd compression, and compressed-image verification'
+    if [[ $DOCUMENTATION_ONLY == true ]]; then
+        printf '  Commands would include inventory collection and documentation generation only'
+    else
+        printf '  Commands would include inventory collection, two ddrescue passes, SHA256 hashing'
+        if [[ $COMPRESSION == zstd ]]; then
+            printf ', zstd compression, and compressed-image verification'
+        fi
     fi
     printf '.\n'
 }
@@ -415,7 +476,11 @@ confirm_targets() {
     local disk
     local answer
 
-    printf 'The following whole disks will be read in full:\n' >&2
+    if [[ -n $MAX_READ_GB ]]; then
+        printf 'The first %s GB of the following whole disks will be read:\n' "$MAX_READ_GB" >&2
+    else
+        printf 'The following whole disks will be read in full:\n' >&2
+    fi
     for disk in "${TARGET_DISKS[@]}"; do
         lsblk --nodeps --output NAME,SIZE,MODEL,SERIAL "$disk" >&2
     done
@@ -430,12 +495,38 @@ confirm_targets() {
     [[ $answer == "$PC_ID" ]] || die "Confirmation did not match; no imaging was performed."
 }
 
+capture_byte_count() {
+    local disk=$1
+    local disk_bytes
+    local sector_bytes
+    local capture_bytes
+    local limit_applied=false
+
+    disk_bytes=$(blockdev --getsize64 "$disk")
+    sector_bytes=$(blockdev --getss "$disk")
+    if [[ -n $MAX_READ_BYTES && $MAX_READ_BYTES -lt $disk_bytes ]]; then
+        capture_bytes=$MAX_READ_BYTES
+        limit_applied=true
+    else
+        capture_bytes=$disk_bytes
+    fi
+
+    capture_bytes=$((capture_bytes / sector_bytes * sector_bytes))
+    if ((capture_bytes == 0)); then
+        die "The requested read limit is smaller than one logical sector on $disk."
+    fi
+    if [[ $limit_applied == true && $capture_bytes -ne $MAX_READ_BYTES ]]; then
+        log_info "Adjusted the capture range to $capture_bytes bytes to match the $sector_bytes-byte logical sector size of $disk."
+    fi
+
+    printf '%s\n' "$capture_bytes"
+}
+
 check_free_space() {
     local disk=$1
-    local required_bytes
+    local required_bytes=$2
     local available_bytes
 
-    required_bytes=$(blockdev --getsize64 "$disk")
     available_bytes=$(df --output=avail --block-size=1 "$ARCHIVE_DIR" | awk 'NR == 2 {print $1}')
 
     if ((available_bytes < required_bytes)); then
@@ -490,7 +581,11 @@ append_source_disk_json() {
     local map_file=$6
     local raw_present=$7
     local log_suffix=$8
+    local capture_bytes=$9
+    local capture_mode=full
     local disk_json
+
+    [[ -z $MAX_READ_GB ]] || capture_mode=limited
 
     disk_json=$(jq --null-input \
         --arg device "$disk" \
@@ -503,12 +598,24 @@ append_source_disk_json() {
         --arg ddrescue_mapfile "$(basename -- "$map_file")" \
         --arg image_base "$image_base" \
         --arg log_suffix "$log_suffix" \
+        --arg capture_mode "$capture_mode" \
+        --arg max_read_gb "$MAX_READ_GB" \
+        --arg max_read_bytes "$MAX_READ_BYTES" \
+        --argjson rescue_domain_bytes "$capture_bytes" \
         --argjson raw_image_present "$raw_present" \
         '{
             device: $device,
             model: $model,
             serial: $serial,
             size_bytes: $size_bytes,
+            capture_status: "completed",
+            capture: {
+                mode: $capture_mode,
+                start_byte: 0,
+                requested_limit_gb: (if $max_read_gb == "" then null else ($max_read_gb | tonumber) end),
+                requested_limit_bytes: (if $max_read_bytes == "" then null else ($max_read_bytes | tonumber) end),
+                rescue_domain_bytes: $rescue_domain_bytes
+            },
             image: $image,
             raw_image_present: $raw_image_present,
             raw_sha256_file: $raw_sha256_file,
@@ -526,6 +633,42 @@ append_source_disk_json() {
         <<< "$SOURCE_DISKS_JSON")
 }
 
+append_documentation_only_disk_json() {
+    local disk=$1
+    local disk_json
+
+    disk_json=$(jq --null-input \
+        --arg device "$disk" \
+        --arg model "$(disk_field "$disk" MODEL)" \
+        --arg serial "$(disk_field "$disk" SERIAL)" \
+        --argjson size_bytes "$(disk_field "$disk" SIZE)" \
+        --arg max_read_gb "$MAX_READ_GB" \
+        --arg max_read_bytes "$MAX_READ_BYTES" \
+        '{
+            device: $device,
+            model: $model,
+            serial: $serial,
+            size_bytes: $size_bytes,
+            capture_status: "not_run",
+            capture: {
+                mode: "documentation_only",
+                start_byte: 0,
+                requested_limit_gb: (if $max_read_gb == "" then null else ($max_read_gb | tonumber) end),
+                requested_limit_bytes: (if $max_read_bytes == "" then null else ($max_read_bytes | tonumber) end),
+                rescue_domain_bytes: 0
+            },
+            image: null,
+            raw_image_present: false,
+            raw_sha256_file: null,
+            compressed_sha256_file: null,
+            ddrescue_mapfile: null,
+            ddrescue_logs: []
+        }')
+
+    SOURCE_DISKS_JSON=$(jq --compact-output --argjson disk "$disk_json" '. + [$disk]' \
+        <<< "$SOURCE_DISKS_JSON")
+}
+
 archive_one_disk() {
     local disk=$1
     local image_base
@@ -537,6 +680,7 @@ archive_one_disk() {
     local final_image
     local raw_present=true
     local log_suffix
+    local capture_bytes
 
     image_base=$(image_base_for_disk "$disk")
     log_suffix=$(log_suffix_for_disk "$image_base")
@@ -545,6 +689,7 @@ archive_one_disk() {
     map_file="$ARCHIVE_DIR/$image_base.ddrescue.map"
     raw_hash_file="$ARCHIVE_DIR/$image_base.img.raw.sha256"
     compressed_hash_file="$ARCHIVE_DIR/$image_base.img.zst.sha256"
+    capture_bytes=$(capture_byte_count "$disk")
 
     if [[ -e $raw_image && ! -e $map_file ]] || [[ ! -e $raw_image && -e $map_file ]]; then
         die "A raw image and ddrescue map must either both exist for resume or both be absent: $image_base"
@@ -554,19 +699,20 @@ archive_one_disk() {
     fi
 
     check_source_mounts "$disk"
-    check_free_space "$disk"
+    check_free_space "$disk" "$capture_bytes"
     log_info "Starting ddrescue first pass for $disk."
     run_recorded_command "ddrescue_pass1_$image_base" \
         "$LOGS_DIR/ddrescue-pass1$log_suffix.log" \
         "$LOGS_DIR/ddrescue-pass1$log_suffix.stderr.log" \
-        ddrescue --no-scrape "$disk" "$raw_image" "$map_file" || \
+        ddrescue --size="$capture_bytes" --no-scrape "$disk" "$raw_image" "$map_file" || \
         die "ddrescue first pass failed for $disk."
 
     log_info "Starting ddrescue retry pass for $disk."
     run_recorded_command "ddrescue_pass2_$image_base" \
         "$LOGS_DIR/ddrescue-pass2$log_suffix.log" \
         "$LOGS_DIR/ddrescue-pass2$log_suffix.stderr.log" \
-        ddrescue --direct --retry-passes="$RETRY_COUNT" "$disk" "$raw_image" "$map_file" || \
+        ddrescue --size="$capture_bytes" --direct --retry-passes="$RETRY_COUNT" \
+        "$disk" "$raw_image" "$map_file" || \
         die "ddrescue retry pass failed for $disk."
 
     run_recorded_command "sha256_raw_$image_base" \
@@ -611,7 +757,8 @@ archive_one_disk() {
 
     append_source_disk_json \
         "$disk" "$image_base" "$final_image" "$raw_hash_file" \
-        "$(basename -- "$compressed_hash_file")" "$map_file" "$raw_present" "$log_suffix"
+        "$(basename -- "$compressed_hash_file")" "$map_file" "$raw_present" "$log_suffix" \
+        "$capture_bytes"
 }
 
 write_archive_summary() {
@@ -619,6 +766,13 @@ write_archive_summary() {
     local completed_epoch=$2
     local warnings_json
     local summary_file="$ARCHIVE_DIR/$PC_ID.archive.json"
+    local run_mode=full_capture
+
+    if [[ $DOCUMENTATION_ONLY == true ]]; then
+        run_mode=documentation_only
+    elif [[ -n $MAX_READ_GB ]]; then
+        run_mode=limited_capture
+    fi
 
     warnings_json=$(jq --null-input '$ARGS.positional' --args "${WARNINGS[@]}")
     jq --null-input \
@@ -629,6 +783,9 @@ write_archive_summary() {
         --arg started_at "$STARTED_AT" \
         --arg completed_at "$completed_at" \
         --arg timezone "$RECORD_TIMEZONE" \
+        --arg run_mode "$run_mode" \
+        --arg max_read_gb "$MAX_READ_GB" \
+        --arg max_read_bytes "$MAX_READ_BYTES" \
         --argjson duration "$(duration_seconds "$STARTED_EPOCH" "$completed_epoch")" \
         --argjson source_disks "$SOURCE_DISKS_JSON" \
         --argjson warnings "$warnings_json" \
@@ -640,6 +797,11 @@ write_archive_summary() {
             completed_at: $completed_at,
             timezone: $timezone,
             duration_seconds: $duration,
+            run: {
+                mode: $run_mode,
+                requested_limit_gb: (if $max_read_gb == "" then null else ($max_read_gb | tonumber) end),
+                requested_limit_bytes: (if $max_read_bytes == "" then null else ($max_read_bytes | tonumber) end)
+            },
             livecd: {
                 os_release_file: "livecd/os-release.txt",
                 uname_file: "livecd/uname.txt",
@@ -662,6 +824,11 @@ write_archive_readmes() {
     local disk_rows=""
     local warning_lines="None."
     local source_disks_text
+    local summary_text
+    local image_text
+    local ddrescue_text
+    local hash_text
+    local capture_mode_text
 
     for disk in "${TARGET_DISKS[@]}"; do
         disk_rows+="| \`$disk\` | $(disk_field "$disk" SIZE) | $(disk_field "$disk" MODEL) | $(disk_field "$disk" SERIAL) |"$'\n'
@@ -675,16 +842,35 @@ write_archive_readmes() {
     source_disks_text=$(printf '%s, ' "${TARGET_DISKS[@]}")
     source_disks_text=${source_disks_text%, }
 
+    if [[ $DOCUMENTATION_ONLY == true ]]; then
+        capture_mode_text="Documentation only; no disk image was created"
+        summary_text="This directory contains system inventory and documentation from a documentation-only run. No disk sectors were copied, and ddrescue, hashing, and compression were not run."
+        image_text="No image files were created. See [$PC_ID.archive.json]($PC_ID.archive.json) for the selected source disks and requested settings."
+        ddrescue_text="ddrescue was intentionally not run in documentation-only mode."
+        hash_text="No image hashes were created because no disk image was captured."
+    else
+        if [[ -n $MAX_READ_GB ]]; then
+            capture_mode_text="Limited capture of the first $MAX_READ_GB GB ($MAX_READ_BYTES bytes maximum)"
+            summary_text="This directory contains limited disk images and records from the archive run. Only the first $MAX_READ_GB decimal GB of each source disk was requested. The source disks were not mounted by this script."
+        else
+            capture_mode_text="Full-disk capture"
+            summary_text="This directory contains whole-disk images and records from the archive run. The source disks were read by GNU ddrescue and were not mounted by this script."
+        fi
+        image_text="See [$PC_ID.archive.json]($PC_ID.archive.json) for the exact image, map, hash, capture range, and log paths for each source disk."
+        ddrescue_text="The ddrescue map files support resuming an interrupted read. Command output and errors are under [logs/](logs/)."
+        hash_text="SHA256 files are next to their corresponding images. Raw-image hashes remain available if a raw image is removed after verified compression."
+    fi
+
     cat > "$readme" <<EOF
 # $PC_ID Archive
 
 ## Summary
 
-This directory contains whole-disk images and records from the archive run. The source disks were read by GNU ddrescue and were not mounted by this script.
+$summary_text
 
 ## Image Files
 
-See [$PC_ID.archive.json]($PC_ID.archive.json) for the exact image, map, hash, and log paths for each source disk.
+$image_text
 
 ## Source Disk
 
@@ -697,6 +883,7 @@ $disk_rows
 - Completed ($RECORD_TIMEZONE): $completed_at
 - Duration: $(duration_seconds "$STARTED_EPOCH" "$completed_epoch") seconds
 - Script version: $SCRIPT_VERSION
+- Capture mode: $capture_mode_text
 
 ## LiveCD OS Information
 
@@ -712,11 +899,11 @@ See [disks/](disks/) for block-device, partition-table, and SMART information.
 
 ## ddrescue Summary
 
-The ddrescue map files support resuming an interrupted read. Command output and errors are under [logs/](logs/).
+$ddrescue_text
 
 ## Hashes
 
-SHA256 files are next to their corresponding images. Raw-image hashes remain available if a raw image is removed after verified compression.
+$hash_text
 
 ## Logs and Supporting Files
 
@@ -737,6 +924,7 @@ EOF
 - Archive completed ($RECORD_TIMEZONE): $completed_at
 - Script version: $SCRIPT_VERSION
 - Source disks: $source_disks_text
+- Capture mode: $capture_mode_text
 - Archive details: [ARCHIVE/README.md](ARCHIVE/README.md)
 EOF
     update_readme_block "$top_readme" "archive-disk.sh" "$managed_block"
@@ -744,10 +932,14 @@ EOF
 }
 
 validate_runtime() {
-    require_root
     require_tool jq jq
     require_tool lsblk util-linux
     require_tool findmnt util-linux
+    if [[ $DOCUMENTATION_ONLY == true ]]; then
+        return 0
+    fi
+
+    require_root
     require_tool blockdev util-linux
     require_tool ddrescue gddrescue
     require_tool sha256sum coreutils
@@ -781,11 +973,17 @@ main() {
     collect_livecd_information
     collect_hardware_information
     collect_disk_information
-    confirm_targets
-
-    for disk in "${TARGET_DISKS[@]}"; do
-        archive_one_disk "$disk"
-    done
+    if [[ $DOCUMENTATION_ONLY == true ]]; then
+        log_info "Documentation-only mode selected; disk imaging is being skipped."
+        for disk in "${TARGET_DISKS[@]}"; do
+            append_documentation_only_disk_json "$disk"
+        done
+    else
+        confirm_targets
+        for disk in "${TARGET_DISKS[@]}"; do
+            archive_one_disk "$disk"
+        done
+    fi
 
     completed_at=$(record_time_now)
     completed_epoch=$(date +%s)
