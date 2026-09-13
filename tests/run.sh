@@ -41,6 +41,18 @@ bash "$PROJECT_DIR/archive-disk.sh" \
     --dry-run > "$TEST_TMP/archive-dry-run.txt" 2>&1
 [[ ! -e $TEST_TMP/archive-output ]] || fail "archive dry run created its output directory"
 assert_file_contains "$TEST_TMP/archive-dry-run.txt" "ddrescue image:"
+assert_file_contains \
+    "$TEST_TMP/archive-dry-run.txt" \
+    "Working directory: $TEST_TMP/archive-output/PC-TEST"
+
+if bash "$PROJECT_DIR/archive-disk.sh" \
+    --pc-id PC-TEST \
+    --output "$TEST_TMP/PC-TEST" \
+    --target /dev/test-disk \
+    --dry-run > "$TEST_TMP/old-output-form.txt" 2>&1; then
+    fail "archive dry run accepted a working directory as its output parent"
+fi
+assert_file_contains "$TEST_TMP/old-output-form.txt" "--output expects the parent directory"
 
 bash "$PROJECT_DIR/archive-disk.sh" \
     --pc-id PC-DOCS \
@@ -66,6 +78,34 @@ assert_file_contains \
 assert_file_contains \
     "$TEST_TMP/fractional-limit-dry-run.txt" \
     "PC-SMALL.first-0.25GB.img"
+
+printf 'Checking interactive disk selection...\n'
+(
+    source "$PROJECT_DIR/archive-disk.sh"
+
+    identify_output_disks() {
+        return 0
+    }
+
+    available_disk_paths() {
+        printf '%s\n' /dev/fixture-a /dev/fixture-b
+    }
+
+    print_disk_summary() {
+        printf '%s 2G Fixture-Disk FIXTURE-SERIAL sata\n' "$1"
+    }
+
+    validate_target_disk() {
+        [[ $1 == /dev/fixture-b ]] || fail "interactive picker selected the wrong disk"
+    }
+
+    select_target_disks <<< $'9\n2' 2> "$TEST_TMP/disk-picker.txt"
+    [[ ${TARGET_DISKS[0]} == /dev/fixture-b ]] || \
+        fail "interactive picker did not save the selected disk"
+)
+assert_file_contains "$TEST_TMP/disk-picker.txt" "[1] /dev/fixture-a"
+assert_file_contains "$TEST_TMP/disk-picker.txt" "Enter an integer from 0 to 2."
+assert_file_contains "$TEST_TMP/disk-picker.txt" "Selected source disk: /dev/fixture-b"
 
 if bash "$PROJECT_DIR/archive-disk.sh" \
     --pc-id PC-TEST \
@@ -114,6 +154,16 @@ jq --exit-status '
     and (.started_at | test("-0[45]:00$"))
     and (.completed_at | test("-0[45]:00$"))
 ' "$COMMANDS_JSONL" >/dev/null || fail "command record is invalid"
+
+run_recorded_command_live visible_fixture_command \
+    "$TEST_TMP/visible-stdout.txt" "$TEST_TMP/visible-stderr.txt" \
+    bash -c 'printf "visible stdout\n"; printf "visible stderr\n" >&2' \
+    > "$TEST_TMP/visible-console-stdout.txt" \
+    2> "$TEST_TMP/visible-console-stderr.txt"
+assert_file_contains "$TEST_TMP/visible-stdout.txt" "visible stdout"
+assert_file_contains "$TEST_TMP/visible-stderr.txt" "visible stderr"
+assert_file_contains "$TEST_TMP/visible-console-stdout.txt" "visible stdout"
+assert_file_contains "$TEST_TMP/visible-console-stderr.txt" "visible stderr"
 
 printf '# Fixture\n\nManual text.\n' > "$TEST_TMP/README.md"
 printf 'First generated value.\n' > "$TEST_TMP/block.md"
@@ -272,15 +322,25 @@ printf 'Checking the archive workflow with command doubles...\n'
         local raw_image=${arguments[argument_count - 2]}
         local map_file=${arguments[argument_count - 1]}
         local argument
+        local direct_io=false
         local size_argument_found=false
 
         for argument in "${arguments[@]}"; do
             if [[ $argument == --size=1000000000 ]]; then
                 size_argument_found=true
-                break
+            elif [[ $argument == --idirect ]]; then
+                direct_io=true
+            elif [[ $argument == --direct ]]; then
+                fail "ddrescue was called with the unsupported --direct option"
             fi
         done
         [[ $size_argument_found == true ]] || fail "limited ddrescue command omitted its byte limit"
+
+        printf 'fixture ddrescue progress\n' >&2
+        if [[ $direct_io == true ]]; then
+            printf 'fixture direct I/O is unavailable\n' >&2
+            return 1
+        fi
 
         if [[ ! -f $raw_image ]]; then
             printf 'fixture disk image\n' > "$raw_image"
@@ -288,14 +348,48 @@ printf 'Checking the archive workflow with command doubles...\n'
         touch "$map_file"
     }
 
+    zstd() {
+        local input_file=""
+        local output_file=""
+
+        if [[ $1 == --test ]]; then
+            return 0
+        fi
+
+        while (($# > 0)); do
+            case $1 in
+                -o)
+                    output_file=$2
+                    shift 2
+                    ;;
+                --output*)
+                    fail "zstd was called with the unsupported --output option"
+                    ;;
+                --*)
+                    shift
+                    ;;
+                *)
+                    input_file=$1
+                    shift
+                    ;;
+            esac
+        done
+
+        [[ -n $input_file && -n $output_file ]] || \
+            fail "zstd did not receive its input and output paths"
+        cp -- "$input_file" "$output_file"
+        printf 'fixture zstd progress\n' >&2
+    }
+
     main \
         --pc-id PC-ARCHIVE-WORKFLOW \
         --output "$TEST_TMP/archive-workflow-output" \
         --target /dev/test-disk \
         --max-read-gb 1 \
-        --compress none \
+        --compress zstd \
         --yes
 )
+ARCHIVE_WORKFLOW_ROOT="$TEST_TMP/archive-workflow-output/PC-ARCHIVE-WORKFLOW"
 jq --exit-status '
     .pc_id == "PC-ARCHIVE-WORKFLOW"
     and .timezone == "America/New_York"
@@ -304,20 +398,28 @@ jq --exit-status '
     and (.started_at | test("-0[45]:00$"))
     and (.completed_at | test("-0[45]:00$"))
     and (.source_disks | length) == 1
-    and .source_disks[0].image == "PC-ARCHIVE-WORKFLOW.first-1GB.img"
+    and .source_disks[0].image == "PC-ARCHIVE-WORKFLOW.first-1GB.img.zst"
     and .source_disks[0].capture.mode == "limited"
     and .source_disks[0].capture.rescue_domain_bytes == 1000000000
-    and .source_disks[0].compressed_sha256_file == null
+    and .source_disks[0].compressed_sha256_file == "PC-ARCHIVE-WORKFLOW.first-1GB.img.zst.sha256"
     and .source_disks[0].ddrescue_logs == [
         "logs/ddrescue-pass1.log",
-        "logs/ddrescue-pass2.log"
+        "logs/ddrescue-pass1.stderr.log",
+        "logs/ddrescue-pass2.log",
+        "logs/ddrescue-pass2.stderr.log",
+        "logs/ddrescue-pass2-buffered.log",
+        "logs/ddrescue-pass2-buffered.stderr.log"
     ]
-' "$TEST_TMP/archive-workflow-output/ARCHIVE/PC-ARCHIVE-WORKFLOW.archive.json" >/dev/null || \
+' "$ARCHIVE_WORKFLOW_ROOT/ARCHIVE/PC-ARCHIVE-WORKFLOW.archive.json" >/dev/null || \
     fail "archive workflow summary returned unexpected data"
 jq --slurp --exit-status '
-    length == 3 and all(.exit_code == 0)
-' "$TEST_TMP/archive-workflow-output/ARCHIVE/commands.jsonl" >/dev/null || \
+    length == 8
+    and ([.[] | select(.exit_code != 0) | .exit_code] == [1])
+    and any(.[]; .name | startswith("ddrescue_pass2_buffered_"))
+' "$ARCHIVE_WORKFLOW_ROOT/ARCHIVE/commands.jsonl" >/dev/null || \
     fail "archive workflow command records returned unexpected data"
+[[ -f $ARCHIVE_WORKFLOW_ROOT/ARCHIVE/PC-ARCHIVE-WORKFLOW.first-1GB.img.zst ]] || \
+    fail "archive workflow did not create its compressed image"
 
 printf 'Checking the documentation-only archive workflow...\n'
 (
@@ -362,6 +464,7 @@ printf 'Checking the documentation-only archive workflow...\n'
         --documentation-only \
         --max-read-gb 2
 )
+DOCUMENTATION_ROOT="$TEST_TMP/documentation-output/PC-DOCUMENTATION"
 jq --exit-status '
     .run.mode == "documentation_only"
     and .run.requested_limit_bytes == 2000000000
@@ -371,15 +474,15 @@ jq --exit-status '
     and .source_disks[0].capture.requested_limit_bytes == 2000000000
     and .source_disks[0].capture.rescue_domain_bytes == 0
     and .source_disks[0].image == null
-' "$TEST_TMP/documentation-output/ARCHIVE/PC-DOCUMENTATION.archive.json" >/dev/null || \
+' "$DOCUMENTATION_ROOT/ARCHIVE/PC-DOCUMENTATION.archive.json" >/dev/null || \
     fail "documentation-only summary returned unexpected data"
-if find "$TEST_TMP/documentation-output/ARCHIVE" -maxdepth 1 \
+if find "$DOCUMENTATION_ROOT/ARCHIVE" -maxdepth 1 \
     \( -name '*.img' -o -name '*.zst' -o -name '*.sha256' -o -name '*.map' \) \
     -print -quit | grep --quiet .; then
     fail "documentation-only mode created an image-related file"
 fi
 assert_file_contains \
-    "$TEST_TMP/documentation-output/ARCHIVE/README.md" \
+    "$DOCUMENTATION_ROOT/ARCHIVE/README.md" \
     "No image files were created."
 
 printf 'Checking the metadata workflow with read-only command doubles...\n'

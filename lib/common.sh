@@ -142,7 +142,10 @@ path_for_record() {
     fi
 }
 
-run_recorded_command() {
+run_recorded_command_with_mode() {
+    local show_output=$1
+    shift
+
     local name=$1
     local stdout_file=$2
     local stderr_file=$3
@@ -169,10 +172,18 @@ run_recorded_command() {
     started_epoch=$(date +%s)
     log_debug "Running command '$name': $(printf '%q ' "$@")"
 
-    if "$@" > "$stdout_file" 2> "$stderr_file"; then
-        exit_code=0
+    if [[ $show_output == true ]]; then
+        if "$@" > >(tee -- "$stdout_file") 2> >(tee -- "$stderr_file" >&2); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
     else
-        exit_code=$?
+        if "$@" > "$stdout_file" 2> "$stderr_file"; then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
     fi
 
     completed_epoch=$(date +%s)
@@ -191,6 +202,14 @@ run_recorded_command() {
         "$stderr_record"
 
     return "$exit_code"
+}
+
+run_recorded_command() {
+    run_recorded_command_with_mode false "$@"
+}
+
+run_recorded_command_live() {
+    run_recorded_command_with_mode true "$@"
 }
 
 record_skipped_command() {

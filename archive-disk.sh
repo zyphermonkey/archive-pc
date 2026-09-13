@@ -8,6 +8,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/lib/common.sh"
 
 PC_ID=""
+OUTPUT_PARENT=""
 OUTPUT_ROOT=""
 TARGET_DISK=""
 ALL_INTERNAL_DISKS=false
@@ -32,14 +33,18 @@ declare -a WARNINGS=()
 usage() {
     cat <<'EOF'
 Usage:
+  archive-disk.sh --pc-id ID --output PATH [options]
   archive-disk.sh --pc-id ID --output PATH --target DEVICE [options]
   archive-disk.sh --pc-id ID --output PATH --all-internal-disks [options]
 
 Required:
   --pc-id ID                      Short identifier, for example PC-001
-  --output PATH                   Root directory for this PC archive
-  --target DEVICE                 Whole source disk to archive
+  --output PATH                   Parent directory; the archive uses PATH/ID
+
+Disk selection:
+  --target DEVICE                 Whole source disk; omit for an interactive list
   --all-internal-disks            Archive every non-removable internal disk
+  (omit both)                     Show available disks and select by number
 
 Options:
   --compress none|zstd            Compression format (default: zstd)
@@ -70,7 +75,7 @@ parse_arguments() {
                 ;;
             --output)
                 (($# >= 2)) || die "--output requires a value."
-                OUTPUT_ROOT=$2
+                OUTPUT_PARENT=$2
                 shift 2
                 ;;
             --target)
@@ -139,8 +144,7 @@ validate_arguments() {
     [[ -n $PC_ID ]] || die "--pc-id is required."
     [[ $PC_ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
         die "--pc-id may contain only letters, numbers, dots, underscores, and hyphens."
-    [[ -n $OUTPUT_ROOT ]] || die "--output is required."
-    [[ $OUTPUT_ROOT != / ]] || die "The filesystem root cannot be used as --output."
+    [[ -n $OUTPUT_PARENT ]] || die "--output is required."
     [[ $COMPRESSION == none || $COMPRESSION == zstd ]] || \
         die "--compress must be 'none' or 'zstd'."
     [[ $RETRY_COUNT =~ ^[0-9]+$ ]] || die "--retry-count must be a non-negative integer."
@@ -162,9 +166,6 @@ validate_arguments() {
     if [[ -n $TARGET_DISK && $ALL_INTERNAL_DISKS == true ]]; then
         die "Use either --target or --all-internal-disks, not both."
     fi
-    if [[ -z $TARGET_DISK && $ALL_INTERNAL_DISKS == false ]]; then
-        die "Either --target or --all-internal-disks is required."
-    fi
     if [[ $REMOVE_RAW == true && $COMPRESSION == none ]]; then
         die "--remove-raw-after-compress requires --compress zstd."
     fi
@@ -172,7 +173,15 @@ validate_arguments() {
         die "--remove-raw-after-compress cannot be used with --documentation-only."
     fi
 
-    OUTPUT_ROOT=$(realpath --canonicalize-missing -- "$OUTPUT_ROOT")
+    OUTPUT_PARENT=$(realpath --canonicalize-missing -- "$OUTPUT_PARENT")
+    [[ $OUTPUT_PARENT != / ]] || \
+        die "The filesystem root cannot be used as the --output parent."
+    if [[ $(basename -- "$OUTPUT_PARENT") == "$PC_ID" ]]; then
+        die \
+            "--output expects the parent directory, but '$OUTPUT_PARENT' already ends with the PC ID." \
+            "Use '$(dirname -- "$OUTPUT_PARENT")' instead."
+    fi
+    OUTPUT_ROOT=$(realpath --canonicalize-missing -- "$OUTPUT_PARENT/$PC_ID")
 }
 
 find_existing_parent() {
@@ -244,6 +253,13 @@ select_target_disks() {
         return 0
     fi
 
+    if [[ $ALL_INTERNAL_DISKS == false ]]; then
+        prompt_for_target_disk
+        validate_target_disk "$TARGET_DISK"
+        TARGET_DISKS+=("$TARGET_DISK")
+        return 0
+    fi
+
     while IFS= read -r disk; do
         [[ -n $disk ]] || continue
         if ! is_output_disk "$disk"; then
@@ -255,6 +271,59 @@ select_target_disks() {
     ((${#TARGET_DISKS[@]} > 0)) || die "No eligible internal disks were found."
     for disk in "${TARGET_DISKS[@]}"; do
         validate_target_disk "$disk"
+    done
+}
+
+available_disk_paths() {
+    local disk
+
+    while IFS= read -r disk; do
+        [[ -n $disk ]] || continue
+        if ! is_output_disk "$disk"; then
+            printf '%s\n' "$disk"
+        fi
+    done < <(lsblk --noheadings --nodeps --paths --output NAME,TYPE |
+        awk '$2 == "disk" {print $1}')
+}
+
+print_disk_summary() {
+    local disk=$1
+
+    lsblk --noheadings --nodeps --paths \
+        --output PATH,SIZE,MODEL,SERIAL,TRAN "$disk"
+}
+
+prompt_for_target_disk() {
+    local -a available_disks=()
+    local index
+    local selection
+
+    mapfile -t available_disks < <(available_disk_paths)
+    ((${#available_disks[@]} > 0)) || \
+        die "No source disks are available after excluding the archive destination disk."
+
+    printf 'Available whole disks (the archive destination disk is excluded):\n' >&2
+    for index in "${!available_disks[@]}"; do
+        printf '  [%d] ' "$((index + 1))" >&2
+        print_disk_summary "${available_disks[index]}" >&2
+    done
+    printf '  [0] Cancel\n' >&2
+
+    while true; do
+        printf 'Select the disk to archive by number: ' >&2
+        if ! read -r selection; then
+            die "No disk selection was received."
+        fi
+        if [[ $selection == 0 ]]; then
+            die "Disk selection was cancelled."
+        fi
+        if [[ $selection =~ ^[1-9][0-9]*$ ]] && \
+            ((selection <= ${#available_disks[@]})); then
+            TARGET_DISK=${available_disks[selection - 1]}
+            printf 'Selected source disk: %s\n' "$TARGET_DISK" >&2
+            return 0
+        fi
+        printf 'Enter an integer from 0 to %d.\n' "${#available_disks[@]}" >&2
     done
 }
 
@@ -291,7 +360,8 @@ show_dry_run() {
 
     printf 'Dry-run archive plan\n'
     printf '  PC ID: %s\n' "$PC_ID"
-    printf '  Output root: %s\n' "$OUTPUT_ROOT"
+    printf '  Output parent: %s\n' "$OUTPUT_PARENT"
+    printf '  Working directory: %s\n' "$OUTPUT_ROOT"
     printf '  Documentation only: %s\n' "$DOCUMENTATION_ONLY"
     if [[ $DOCUMENTATION_ONLY == true ]]; then
         printf '  Compression: not applicable\n'
@@ -582,6 +652,7 @@ append_source_disk_json() {
     local raw_present=$7
     local log_suffix=$8
     local capture_bytes=$9
+    local buffered_retry_used=${10}
     local capture_mode=full
     local disk_json
 
@@ -603,6 +674,7 @@ append_source_disk_json() {
         --arg max_read_bytes "$MAX_READ_BYTES" \
         --argjson rescue_domain_bytes "$capture_bytes" \
         --argjson raw_image_present "$raw_present" \
+        --argjson buffered_retry_used "$buffered_retry_used" \
         '{
             device: $device,
             model: $model,
@@ -623,10 +695,23 @@ append_source_disk_json() {
                 if $compressed_sha256_file == "" then null else $compressed_sha256_file end
             ),
             ddrescue_mapfile: $ddrescue_mapfile,
-            ddrescue_logs: [
-                ("logs/ddrescue-pass1" + $log_suffix + ".log"),
-                ("logs/ddrescue-pass2" + $log_suffix + ".log")
-            ]
+            ddrescue_logs: (
+                [
+                    ("logs/ddrescue-pass1" + $log_suffix + ".log"),
+                    ("logs/ddrescue-pass1" + $log_suffix + ".stderr.log"),
+                    ("logs/ddrescue-pass2" + $log_suffix + ".log"),
+                    ("logs/ddrescue-pass2" + $log_suffix + ".stderr.log")
+                ] + (
+                    if $buffered_retry_used then
+                        [
+                            ("logs/ddrescue-pass2-buffered" + $log_suffix + ".log"),
+                            ("logs/ddrescue-pass2-buffered" + $log_suffix + ".stderr.log")
+                        ]
+                    else
+                        []
+                    end
+                )
+            )
         }')
 
     SOURCE_DISKS_JSON=$(jq --compact-output --argjson disk "$disk_json" '. + [$disk]' \
@@ -681,6 +766,7 @@ archive_one_disk() {
     local raw_present=true
     local log_suffix
     local capture_bytes
+    local buffered_retry_used=false
 
     image_base=$(image_base_for_disk "$disk")
     log_suffix=$(log_suffix_for_disk "$image_base")
@@ -701,19 +787,28 @@ archive_one_disk() {
     check_source_mounts "$disk"
     check_free_space "$disk" "$capture_bytes"
     log_info "Starting ddrescue first pass for $disk."
-    run_recorded_command "ddrescue_pass1_$image_base" \
+    run_recorded_command_live "ddrescue_pass1_$image_base" \
         "$LOGS_DIR/ddrescue-pass1$log_suffix.log" \
         "$LOGS_DIR/ddrescue-pass1$log_suffix.stderr.log" \
         ddrescue --size="$capture_bytes" --no-scrape "$disk" "$raw_image" "$map_file" || \
         die "ddrescue first pass failed for $disk."
 
-    log_info "Starting ddrescue retry pass for $disk."
-    run_recorded_command "ddrescue_pass2_$image_base" \
+    log_info "Starting ddrescue direct-I/O retry pass for $disk."
+    if ! run_recorded_command_live "ddrescue_pass2_$image_base" \
         "$LOGS_DIR/ddrescue-pass2$log_suffix.log" \
         "$LOGS_DIR/ddrescue-pass2$log_suffix.stderr.log" \
-        ddrescue --size="$capture_bytes" --direct --retry-passes="$RETRY_COUNT" \
-        "$disk" "$raw_image" "$map_file" || \
-        die "ddrescue retry pass failed for $disk."
+        ddrescue --size="$capture_bytes" --idirect --retry-passes="$RETRY_COUNT" \
+        "$disk" "$raw_image" "$map_file"; then
+        buffered_retry_used=true
+        add_warning \
+            "The direct-I/O ddrescue retry pass failed for $disk; retrying with buffered I/O."
+        run_recorded_command_live "ddrescue_pass2_buffered_$image_base" \
+            "$LOGS_DIR/ddrescue-pass2-buffered$log_suffix.log" \
+            "$LOGS_DIR/ddrescue-pass2-buffered$log_suffix.stderr.log" \
+            ddrescue --size="$capture_bytes" --retry-passes="$RETRY_COUNT" \
+            "$disk" "$raw_image" "$map_file" || \
+            die "Both direct and buffered ddrescue retry passes failed for $disk."
+    fi
 
     run_recorded_command "sha256_raw_$image_base" \
         "$raw_hash_file" "$LOGS_DIR/sha256-raw$log_suffix.stderr.log" \
@@ -723,9 +818,9 @@ archive_one_disk() {
     if [[ $COMPRESSION == zstd ]]; then
         log_info "Compressing $raw_image with zstd."
         PARTIAL_COMPRESSED_IMAGE=$compressed_image
-        run_recorded_command "zstd_$image_base" \
+        run_recorded_command_live "zstd_$image_base" \
             "$LOGS_DIR/zstd$log_suffix.log" "$LOGS_DIR/zstd$log_suffix.stderr.log" \
-            zstd --threads=0 --verbose --keep --output="$compressed_image" "$raw_image" || \
+            zstd --threads=0 --verbose --keep -o "$compressed_image" "$raw_image" || \
             die "Compression failed for $raw_image."
         run_recorded_command "sha256_compressed_$image_base" \
             "$compressed_hash_file" "$LOGS_DIR/sha256-compressed$log_suffix.stderr.log" \
@@ -758,7 +853,7 @@ archive_one_disk() {
     append_source_disk_json \
         "$disk" "$image_base" "$final_image" "$raw_hash_file" \
         "$(basename -- "$compressed_hash_file")" "$map_file" "$raw_present" "$log_suffix" \
-        "$capture_bytes"
+        "$capture_bytes" "$buffered_retry_used"
 }
 
 write_archive_summary() {
@@ -943,6 +1038,7 @@ validate_runtime() {
     require_tool blockdev util-linux
     require_tool ddrescue gddrescue
     require_tool sha256sum coreutils
+    require_tool tee coreutils
     if [[ $COMPRESSION == zstd ]]; then
         require_tool zstd zstd
     fi

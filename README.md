@@ -40,7 +40,18 @@ Package names can differ between Debian releases. `archive-disk.sh` records opti
 
 ## Capture a disk
 
-First inspect the devices yourself:
+When neither `--target` nor `--all-internal-disks` is supplied, the script displays the available whole disks and prompts for an integer selection. The disk containing the archive output is excluded when that relationship can be resolved:
+
+```bash
+sudo ./archive-disk.sh \
+  --pc-id PC-001 \
+  --output /mnt/archive \
+  --compress zstd
+```
+
+`--output` is the parent directory. The script derives its working directory from `--pc-id`, so this example writes everything beneath `/mnt/archive/PC-001/`.
+
+You can also inspect the devices yourself and select one explicitly:
 
 ```bash
 lsblk --output NAME,PATH,SIZE,MODEL,SERIAL,TYPE,MOUNTPOINTS
@@ -51,7 +62,7 @@ Preview the archive plan without creating directories or reading the full disk:
 ```bash
 sudo ./archive-disk.sh \
   --pc-id PC-001 \
-  --output /mnt/archive/PC-001 \
+  --output /mnt/archive \
   --target /dev/disk/by-id/ata-example \
   --compress zstd \
   --dry-run
@@ -62,13 +73,15 @@ Run the capture:
 ```bash
 sudo ./archive-disk.sh \
   --pc-id PC-001 \
-  --output /mnt/archive/PC-001 \
+  --output /mnt/archive \
   --target /dev/disk/by-id/ata-example \
   --compress zstd \
   --retry-count 3
 ```
 
 The default keeps both the raw and compressed images. Add `--remove-raw-after-compress` to remove the raw image only after the compressed image has been hashed and that hash has been successfully verified. A raw image and its ddrescue map file can be reused to resume an interrupted capture.
+
+ddrescue progress and errors are displayed live while also being saved under `ARCHIVE/logs/`. The retry pass first requests direct input I/O. If the device or operating system does not support it, the script records that failed attempt and automatically retries using buffered I/O. Compression output is also displayed live.
 
 `--all-internal-disks` selects all non-removable whole disks except the resolved output disk. Explicit `--target` selection is easier to audit and is recommended when only one disk is being archived.
 
@@ -79,7 +92,7 @@ Use `--documentation-only` (or its shorter alias, `--docs-only`) to generate the
 ```bash
 sudo ./archive-disk.sh \
   --pc-id PC-001-DEMO \
-  --output /mnt/archive/PC-001-DEMO \
+  --output /mnt/archive \
   --target /dev/disk/by-id/ata-example \
   --documentation-only
 ```
@@ -93,7 +106,7 @@ Use `--max-read-gb NUMBER` to capture only the requested number of decimal gigab
 ```bash
 sudo ./archive-disk.sh \
   --pc-id PC-001-TEST \
-  --output /mnt/archive/PC-001-TEST \
+  --output /mnt/archive \
   --target /dev/disk/by-id/ata-example \
   --max-read-gb 2 \
   --compress none
