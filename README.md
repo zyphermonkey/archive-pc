@@ -38,6 +38,8 @@ sudo apt-get install --no-install-recommends \
 
 Package names can differ between Debian releases. `archive-disk.sh` records optional tools as skipped instead of failing the disk image. `extract-metadata.sh` requires the libguestfs commands used for read-only inspection; Windows registry, event-log, RPM, and boot-history details remain best effort.
 
+Before a real archive run, `archive-disk.sh` checks the commands needed by the selected mode and the optional hardware-inventory commands. Missing required and optional apt packages are listed separately. The script prompts before installing either group, runs `apt-get` directly because archive runs are already root, and rechecks the commands after installation. Dry runs never install packages.
+
 ## Capture a disk
 
 All three setup values can be selected interactively:
@@ -90,6 +92,8 @@ sudo ./archive-disk.sh \
 The default keeps both the raw and compressed images. Add `--remove-raw-after-compress` to remove the raw image only after the compressed image has been hashed and that hash has been successfully verified. A raw image and its ddrescue map file can be reused to resume an interrupted capture.
 
 ddrescue progress and errors are displayed live while also being saved under `ARCHIVE/logs/`. The retry pass first requests direct input I/O. If the device or operating system does not support it, the script records that failed attempt and automatically retries using buffered I/O. Compression output is also displayed live.
+
+SMART reports are written to `ARCHIVE/disks/smartctl-DEVICE.txt`. `smartctl` uses nonzero status bits for disk-health and error-history findings, so those findings are recorded as specific archive warnings rather than being mislabeled as collection failures. If a command returns no stderr, its stderr log explains that the useful output is in the corresponding report file.
 
 `--all-internal-disks` selects all non-removable whole disks except the resolved output disk. Explicit `--target` selection is easier to audit and is recommended when only one disk is being archived.
 

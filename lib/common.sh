@@ -31,7 +31,10 @@ log_message() {
     shift
 
     local message
-    message="$(record_time_now) [$level] $*"
+    local message_text
+    printf -v message_text '%s ' "$@"
+    message_text=${message_text% }
+    message="$(record_time_now) [$level] $message_text"
     printf '%s\n' "$message" >&2
 
     if [[ -n ${LOG_FILE:-} && -d $(dirname "$LOG_FILE") ]]; then
@@ -242,6 +245,7 @@ run_optional_command() {
     local stdout_file=$2
     local stderr_file=$3
     local tool=$4
+    local exit_code
     shift 4
 
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -258,13 +262,35 @@ run_optional_command() {
         return 0
     fi
 
-    if ! run_recorded_command "$name" "$stdout_file" "$stderr_file" "$tool" "$@"; then
-        if declare -F add_warning >/dev/null 2>&1; then
-            add_warning "Optional collection command '$name' failed; see $stderr_file"
-        else
-            log_warn "Optional collection command '$name' failed; see $stderr_file"
-        fi
+    if run_recorded_command "$name" "$stdout_file" "$stderr_file" "$tool" "$@"; then
         return 0
+    else
+        exit_code=$?
+    fi
+
+    add_missing_stderr_context "$exit_code" "$stdout_file" "$stderr_file"
+    if declare -F add_warning >/dev/null 2>&1; then
+        add_warning \
+            "Optional collection command '$name' exited with status $exit_code;" \
+            "see $stdout_file and $stderr_file"
+    else
+        log_warn \
+            "Optional collection command '$name' exited with status $exit_code;" \
+            "see $stdout_file and $stderr_file"
+    fi
+    return 0
+}
+
+add_missing_stderr_context() {
+    local exit_code=$1
+    local stdout_file=$2
+    local stderr_file=$3
+
+    if [[ ! -s $stderr_file ]]; then
+        printf '%s\n' \
+            "Command exited with status $exit_code but wrote no standard error." \
+            "Review its captured standard output: $stdout_file" \
+            > "$stderr_file"
     fi
 }
 

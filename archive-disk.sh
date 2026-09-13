@@ -29,6 +29,8 @@ PARTIAL_COMPRESSED_IMAGE=""
 declare -a TARGET_DISKS=()
 declare -a OUTPUT_DISKS=()
 declare -a WARNINGS=()
+declare -a MISSING_REQUIRED_PACKAGES=()
+declare -a MISSING_OPTIONAL_PACKAGES=()
 
 usage() {
     cat <<'EOF'
@@ -59,8 +61,12 @@ EOF
 }
 
 add_warning() {
-    WARNINGS+=("$*")
-    log_warn "$*"
+    local warning
+
+    printf -v warning '%s ' "$@"
+    warning=${warning% }
+    WARNINGS+=("$warning")
+    log_warn "$warning"
 }
 
 pc_id_is_valid() {
@@ -210,6 +216,212 @@ prompt_for_missing_arguments() {
     fi
     if [[ -z $OUTPUT_PARENT ]]; then
         prompt_for_output_parent
+    fi
+}
+
+tool_is_available() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+add_missing_required_package() {
+    local package=$1
+    local existing_package
+
+    for existing_package in "${MISSING_REQUIRED_PACKAGES[@]}"; do
+        [[ $existing_package == "$package" ]] && return 0
+    done
+    MISSING_REQUIRED_PACKAGES+=("$package")
+}
+
+add_missing_optional_package() {
+    local package=$1
+    local existing_package
+
+    for existing_package in "${MISSING_OPTIONAL_PACKAGES[@]}"; do
+        [[ $existing_package == "$package" ]] && return 0
+    done
+    MISSING_OPTIONAL_PACKAGES+=("$package")
+}
+
+check_required_tool() {
+    local tool=$1
+    local package=$2
+
+    tool_is_available "$tool" || add_missing_required_package "$package"
+}
+
+check_optional_tool() {
+    local tool=$1
+    local package=$2
+
+    tool_is_available "$tool" || add_missing_optional_package "$package"
+}
+
+collect_missing_dependencies() {
+    MISSING_REQUIRED_PACKAGES=()
+    MISSING_OPTIONAL_PACKAGES=()
+
+    check_required_tool awk mawk
+    check_required_tool df coreutils
+    check_required_tool findmnt util-linux
+    check_required_tool jq jq
+    check_required_tool lsblk util-linux
+    check_required_tool realpath coreutils
+    check_required_tool sed sed
+
+    if [[ $DOCUMENTATION_ONLY == false ]]; then
+        check_required_tool blockdev util-linux
+        check_required_tool ddrescue gddrescue
+        check_required_tool sha256sum coreutils
+        check_required_tool tee coreutils
+        if [[ $COMPRESSION == zstd ]]; then
+            check_required_tool zstd zstd
+        fi
+    fi
+
+    check_optional_tool dmidecode dmidecode
+    check_optional_tool lshw lshw
+    check_optional_tool lspci pciutils
+    check_optional_tool lsusb usbutils
+    check_optional_tool parted parted
+    check_optional_tool sfdisk fdisk
+    check_optional_tool smartctl smartmontools
+    check_optional_tool timedatectl systemd
+}
+
+print_package_list() {
+    local heading=$1
+    shift
+    local package
+
+    printf '%s\n' "$heading" >&2
+    for package in "$@"; do
+        printf '  - %s\n' "$package" >&2
+    done
+}
+
+prompt_yes_or_no() {
+    local question=$1
+    local default_answer=$2
+    local answer
+    local choices
+
+    if [[ $default_answer == yes ]]; then
+        choices='[Y/n]'
+    else
+        choices='[y/N]'
+    fi
+
+    while true; do
+        printf '%s %s ' "$question" "$choices" >&2
+        if ! read -r answer; then
+            return 1
+        fi
+        case ${answer,,} in
+            y|yes)
+                return 0
+                ;;
+            n|no)
+                return 1
+                ;;
+            '')
+                if [[ $default_answer == yes ]]; then
+                    return 0
+                fi
+                return 1
+                ;;
+            *)
+                printf 'Enter yes or no.\n' >&2
+                ;;
+        esac
+    done
+}
+
+install_packages_with_apt() {
+    local -a packages=("$@")
+
+    ((EUID == 0)) || die "Package installation must be run as root."
+    tool_is_available apt-get || \
+        die "Missing packages were found, but apt-get is not available."
+
+    printf 'Updating apt package indexes...\n' >&2
+    apt-get update || die "apt-get update failed."
+    printf 'Installing selected packages...\n' >&2
+    DEBIAN_FRONTEND=noninteractive \
+        apt-get install --yes --no-install-recommends "${packages[@]}" || \
+        die "apt-get could not install all selected packages."
+    hash -r
+}
+
+check_and_offer_dependencies() {
+    local install_optional=false
+    local install_required=false
+    local package
+    local -a packages_to_install=()
+    local -A queued_packages=()
+
+    collect_missing_dependencies
+    if ((${#MISSING_REQUIRED_PACKAGES[@]} == 0 && \
+        ${#MISSING_OPTIONAL_PACKAGES[@]} == 0)); then
+        printf 'All required and optional archive tools are installed.\n' >&2
+        return 0
+    fi
+
+    if ((${#MISSING_REQUIRED_PACKAGES[@]} > 0)); then
+        print_package_list \
+            'Missing packages required for this archive mode:' \
+            "${MISSING_REQUIRED_PACKAGES[@]}"
+        if prompt_yes_or_no 'Install the missing required packages with apt?' yes; then
+            install_required=true
+        else
+            die "Required packages were declined; the archive cannot continue."
+        fi
+    fi
+
+    if ((${#MISSING_OPTIONAL_PACKAGES[@]} > 0)); then
+        print_package_list \
+            'Missing optional packages that improve inventory collection:' \
+            "${MISSING_OPTIONAL_PACKAGES[@]}"
+        if prompt_yes_or_no 'Install the missing optional packages with apt?' no; then
+            install_optional=true
+        else
+            log_warn "Optional package installation was declined; related inventory will be skipped."
+        fi
+    fi
+
+    if [[ $install_required == true ]]; then
+        for package in "${MISSING_REQUIRED_PACKAGES[@]}"; do
+            if [[ -z ${queued_packages[$package]+present} ]]; then
+                queued_packages[$package]=true
+                packages_to_install+=("$package")
+            fi
+        done
+    fi
+    if [[ $install_optional == true ]]; then
+        for package in "${MISSING_OPTIONAL_PACKAGES[@]}"; do
+            if [[ -z ${queued_packages[$package]+present} ]]; then
+                queued_packages[$package]=true
+                packages_to_install+=("$package")
+            fi
+        done
+    fi
+
+    if ((${#packages_to_install[@]} > 0)); then
+        install_packages_with_apt "${packages_to_install[@]}"
+        collect_missing_dependencies
+    fi
+
+    if ((${#MISSING_REQUIRED_PACKAGES[@]} > 0)); then
+        print_package_list \
+            'Required packages still missing after the dependency check:' \
+            "${MISSING_REQUIRED_PACKAGES[@]}"
+        die "Required archive tools are unavailable."
+    fi
+    if [[ $install_optional == true && ${#MISSING_OPTIONAL_PACKAGES[@]} -gt 0 ]]; then
+        print_package_list \
+            'Optional packages still missing after installation:' \
+            "${MISSING_OPTIONAL_PACKAGES[@]}"
+        log_warn "Some optional inventory tools remain unavailable."
     fi
 }
 
@@ -648,6 +860,66 @@ collect_hardware_information() {
         lspci -nn
 }
 
+run_smartctl_collection() {
+    local name=$1
+    local stdout_file=$2
+    local stderr_file=$3
+    local disk=$4
+    local exit_code
+
+    if ! tool_is_available smartctl; then
+        run_optional_command \
+            "$name" "$stdout_file" "$stderr_file" smartctl -x "$disk"
+        return 0
+    fi
+
+    if run_recorded_command \
+        "$name" "$stdout_file" "$stderr_file" smartctl -x "$disk"; then
+        return 0
+    else
+        exit_code=$?
+    fi
+
+    add_missing_stderr_context "$exit_code" "$stdout_file" "$stderr_file"
+
+    if ((exit_code & 1)); then
+        add_warning \
+            "smartctl could not parse its command for $disk (exit status $exit_code);" \
+            "see $stdout_file and $stderr_file"
+    fi
+    if ((exit_code & 2)); then
+        add_warning \
+            "smartctl could not open or identify $disk (exit status $exit_code);" \
+            "see $stdout_file and $stderr_file"
+    fi
+    if ((exit_code & 4)); then
+        add_warning \
+            "One or more SMART commands or checksums failed for $disk;" \
+            "the report in $stdout_file may be incomplete."
+    fi
+    if ((exit_code & 8)); then
+        add_warning "SMART reports that $disk is failing; review $stdout_file immediately."
+    fi
+    if ((exit_code & 16)); then
+        add_warning \
+            "SMART reports a prefailure attribute at or below its threshold for $disk;" \
+            "review $stdout_file."
+    fi
+    if ((exit_code & 32)); then
+        add_warning \
+            "SMART reports that an attribute previously crossed its threshold for $disk;" \
+            "review $stdout_file."
+    fi
+    if ((exit_code & 64)); then
+        add_warning "The SMART error log for $disk contains recorded errors; review $stdout_file."
+    fi
+    if ((exit_code & 128)); then
+        add_warning "The SMART self-test log for $disk contains errors; review $stdout_file."
+    fi
+
+    return 0
+}
+
 collect_disk_information() {
     local disk
     local disk_name
@@ -667,9 +939,9 @@ collect_disk_information() {
     for disk in "${TARGET_DISKS[@]}"; do
         disk_name=$(basename -- "$disk")
         safe_name=${disk_name//[^A-Za-z0-9._-]/_}
-        run_optional_command "collect_smartctl_$safe_name" \
+        run_smartctl_collection "collect_smartctl_$safe_name" \
             "$output_dir/smartctl-$safe_name.txt" "$LOGS_DIR/collect_smartctl-$safe_name.stderr.log" \
-            smartctl -x "$disk"
+            "$disk"
         run_optional_command "collect_parted_$safe_name" \
             "$output_dir/parted-$safe_name.txt" "$LOGS_DIR/collect_parted-$safe_name.stderr.log" \
             parted -s "$disk" unit s print
@@ -1198,7 +1470,15 @@ main() {
     local completed_epoch
 
     parse_arguments "$@"
-    prompt_for_missing_arguments
+    if [[ -z $PC_ID ]]; then
+        prompt_for_pc_id
+    fi
+    if [[ $DRY_RUN == false ]]; then
+        check_and_offer_dependencies
+    fi
+    if [[ -z $OUTPUT_PARENT ]]; then
+        prompt_for_output_parent
+    fi
     validate_arguments
     select_target_disks
 

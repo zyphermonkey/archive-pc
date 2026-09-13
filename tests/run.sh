@@ -102,6 +102,36 @@ assert_file_contains "$TEST_TMP/archive-setup-prompts.txt" "Selected output pare
         fail "output picker did not accept a custom directory"
 )
 
+printf 'Checking dependency installation prompts...\n'
+(
+    source "$PROJECT_DIR/archive-disk.sh"
+    dependencies_installed=false
+
+    tool_is_available() {
+        case $1 in
+            ddrescue|smartctl)
+                [[ $dependencies_installed == true ]]
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    }
+
+    install_packages_with_apt() {
+        printf '%s\n' "$@" > "$TEST_TMP/requested-packages.txt"
+        dependencies_installed=true
+    }
+
+    COMPRESSION=none
+    check_and_offer_dependencies <<< $'y\ny' \
+        2> "$TEST_TMP/dependency-prompts.txt"
+)
+assert_file_contains "$TEST_TMP/dependency-prompts.txt" "Missing packages required"
+assert_file_contains "$TEST_TMP/dependency-prompts.txt" "Missing optional packages"
+assert_file_contains "$TEST_TMP/requested-packages.txt" "gddrescue"
+assert_file_contains "$TEST_TMP/requested-packages.txt" "smartmontools"
+
 bash "$PROJECT_DIR/archive-disk.sh" \
     --pc-id PC-DOCS \
     --output "$TEST_TMP/documentation-dry-output" \
@@ -154,6 +184,31 @@ printf 'Checking interactive disk selection...\n'
 assert_file_contains "$TEST_TMP/disk-picker.txt" "[1] /dev/fixture-a"
 assert_file_contains "$TEST_TMP/disk-picker.txt" "Enter an integer from 0 to 2."
 assert_file_contains "$TEST_TMP/disk-picker.txt" "Selected source disk: /dev/fixture-b"
+
+printf 'Checking smartctl status interpretation...\n'
+(
+    source "$PROJECT_DIR/archive-disk.sh"
+    COMMANDS_JSONL="$TEST_TMP/smartctl-commands.jsonl"
+    RECORD_ROOT="$TEST_TMP"
+
+    smartctl() {
+        printf 'SMART report with a recorded error log entry\n'
+        return 64
+    }
+
+    run_smartctl_collection \
+        collect_smartctl_sda \
+        "$TEST_TMP/smartctl-sda.txt" \
+        "$TEST_TMP/collect_smartctl-sda.stderr.log" \
+        /dev/sda \
+        2> "$TEST_TMP/smartctl-console.txt"
+)
+assert_file_contains "$TEST_TMP/smartctl-sda.txt" "SMART report"
+assert_file_contains "$TEST_TMP/collect_smartctl-sda.stderr.log" "wrote no standard error"
+assert_file_contains "$TEST_TMP/smartctl-console.txt" "contains recorded errors"
+jq --exit-status '.name == "collect_smartctl_sda" and .exit_code == 64' \
+    "$TEST_TMP/smartctl-commands.jsonl" >/dev/null || \
+    fail "smartctl command record did not retain its bitmask exit status"
 
 if bash "$PROJECT_DIR/archive-disk.sh" \
     --pc-id PC-TEST \
@@ -212,6 +267,13 @@ assert_file_contains "$TEST_TMP/visible-stdout.txt" "visible stdout"
 assert_file_contains "$TEST_TMP/visible-stderr.txt" "visible stderr"
 assert_file_contains "$TEST_TMP/visible-console-stdout.txt" "visible stdout"
 assert_file_contains "$TEST_TMP/visible-console-stderr.txt" "visible stderr"
+
+run_optional_command optional_empty_stderr \
+    "$TEST_TMP/optional-stdout.txt" "$TEST_TMP/optional-stderr.txt" \
+    bash -c 'printf "failure details on stdout\n"; exit 7'
+assert_file_contains "$TEST_TMP/optional-stdout.txt" "failure details on stdout"
+assert_file_contains "$TEST_TMP/optional-stderr.txt" "wrote no standard error"
+assert_file_contains "$TEST_TMP/optional-stderr.txt" "$TEST_TMP/optional-stdout.txt"
 
 printf '# Fixture\n\nManual text.\n' > "$TEST_TMP/README.md"
 printf 'First generated value.\n' > "$TEST_TMP/block.md"
@@ -325,6 +387,10 @@ printf 'Checking the archive workflow with command doubles...\n'
     }
 
     validate_runtime() {
+        return 0
+    }
+
+    check_and_offer_dependencies() {
         return 0
     }
 
@@ -478,6 +544,10 @@ printf 'Checking the documentation-only archive workflow...\n'
     }
 
     validate_runtime() {
+        return 0
+    }
+
+    check_and_offer_dependencies() {
         return 0
     }
 
