@@ -33,13 +33,11 @@ declare -a WARNINGS=()
 usage() {
     cat <<'EOF'
 Usage:
-  archive-disk.sh --pc-id ID --output PATH [options]
-  archive-disk.sh --pc-id ID --output PATH --target DEVICE [options]
-  archive-disk.sh --pc-id ID --output PATH --all-internal-disks [options]
+  archive-disk.sh [options]
 
-Required:
-  --pc-id ID                      Short identifier, for example PC-001
-  --output PATH                   Parent directory; the archive uses PATH/ID
+Archive identity and destination:
+  --pc-id ID                      Identifier; prompted as text when omitted
+  --output PATH                   Parent directory; prompted as a list when omitted
 
 Disk selection:
   --target DEVICE                 Whole source disk; omit for an interactive list
@@ -63,6 +61,125 @@ EOF
 add_warning() {
     WARNINGS+=("$*")
     log_warn "$*"
+}
+
+pc_id_is_valid() {
+    local pc_id=$1
+
+    [[ $pc_id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+prompt_for_pc_id() {
+    local entered_pc_id
+
+    while true; do
+        printf 'Enter the PC ID (for example, PC-001): ' >&2
+        if ! read -r entered_pc_id; then
+            die "No PC ID was received."
+        fi
+        if pc_id_is_valid "$entered_pc_id"; then
+            PC_ID=$entered_pc_id
+            return 0
+        fi
+        printf '%s\n' \
+            "Use letters, numbers, dots, underscores, or hyphens; the first character must be a letter or number." \
+            >&2
+    done
+}
+
+available_output_paths() {
+    local mount_options
+    local mount_point
+
+    while IFS= read -r mount_point; do
+        [[ -n $mount_point && $mount_point != / ]] || continue
+        mount_options=$(findmnt --noheadings --output OPTIONS --target "$mount_point" 2>/dev/null || true)
+        if [[ ,$mount_options, == *,rw,* ]]; then
+            printf '%s\n' "$mount_point"
+        fi
+    done < <(findmnt --real --list --noheadings --raw --output TARGET 2>/dev/null)
+}
+
+print_output_summary() {
+    local output_path=$1
+    local available
+    local filesystem
+    local source
+
+    source=$(findmnt --noheadings --output SOURCE --target "$output_path" 2>/dev/null || true)
+    filesystem=$(findmnt --noheadings --output FSTYPE --target "$output_path" 2>/dev/null || true)
+    available=$(df --human-readable --output=avail "$output_path" 2>/dev/null |
+        awk 'NR == 2 {print $1}' || true)
+
+    printf '%s (source: %s, filesystem: %s, available: %s)\n' \
+        "$output_path" \
+        "${source:-unknown}" \
+        "${filesystem:-unknown}" \
+        "${available:-unknown}"
+}
+
+prompt_for_custom_output_path() {
+    local entered_path
+
+    printf 'Enter the output parent directory: ' >&2
+    if ! read -r entered_path; then
+        die "No output directory was received."
+    fi
+    [[ -n $entered_path ]] || die "The output parent directory cannot be empty."
+    OUTPUT_PARENT=$entered_path
+}
+
+prompt_for_output_parent() {
+    local -a output_paths=()
+    local custom_selection
+    local index
+    local selection
+
+    mapfile -t output_paths < <(available_output_paths)
+    if ((${#output_paths[@]} == 0)); then
+        printf 'No writable non-root filesystem mount points were found.\n' >&2
+        prompt_for_custom_output_path
+        return 0
+    fi
+
+    custom_selection=$((${#output_paths[@]} + 1))
+    printf 'Available output parent directories:\n' >&2
+    for index in "${!output_paths[@]}"; do
+        printf '  [%d] ' "$((index + 1))" >&2
+        print_output_summary "${output_paths[index]}" >&2
+    done
+    printf '  [%d] Enter a different directory path\n' "$custom_selection" >&2
+    printf '  [0] Cancel\n' >&2
+
+    while true; do
+        printf 'Select the output parent directory by number: ' >&2
+        if ! read -r selection; then
+            die "No output directory selection was received."
+        fi
+        if [[ $selection == 0 ]]; then
+            die "Output directory selection was cancelled."
+        fi
+        if [[ $selection =~ ^[1-9][0-9]*$ ]] && \
+            ((selection <= ${#output_paths[@]})); then
+            OUTPUT_PARENT=${output_paths[selection - 1]}
+            printf 'Selected output parent: %s\n' "$OUTPUT_PARENT" >&2
+            return 0
+        fi
+        if [[ $selection == "$custom_selection" ]]; then
+            prompt_for_custom_output_path
+            return 0
+        fi
+        printf 'Enter an integer from 0 to %d.\n' "$custom_selection" >&2
+    done
+}
+
+prompt_for_missing_arguments() {
+    if [[ -z $PC_ID ]]; then
+        prompt_for_pc_id
+    fi
+    if [[ -z $OUTPUT_PARENT ]]; then
+        prompt_for_output_parent
+    fi
 }
 
 parse_arguments() {
@@ -141,10 +258,10 @@ validate_arguments() {
     local whole_gb
     local fractional_gb
 
-    [[ -n $PC_ID ]] || die "--pc-id is required."
-    [[ $PC_ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+    [[ -n $PC_ID ]] || die "A PC ID is required."
+    pc_id_is_valid "$PC_ID" || \
         die "--pc-id may contain only letters, numbers, dots, underscores, and hyphens."
-    [[ -n $OUTPUT_PARENT ]] || die "--output is required."
+    [[ -n $OUTPUT_PARENT ]] || die "An output parent directory is required."
     [[ $COMPRESSION == none || $COMPRESSION == zstd ]] || \
         die "--compress must be 'none' or 'zstd'."
     [[ $RETRY_COUNT =~ ^[0-9]+$ ]] || die "--retry-count must be a non-negative integer."
@@ -1050,6 +1167,7 @@ main() {
     local completed_epoch
 
     parse_arguments "$@"
+    prompt_for_missing_arguments
     validate_arguments
     select_target_disks
 

@@ -54,6 +54,48 @@ if bash "$PROJECT_DIR/archive-disk.sh" \
 fi
 assert_file_contains "$TEST_TMP/old-output-form.txt" "--output expects the parent directory"
 
+printf 'Checking interactive PC ID and output selection...\n'
+(
+    source "$PROJECT_DIR/archive-disk.sh"
+
+    available_output_paths() {
+        printf '%s\n' /mnt/fixture-a /mnt/fixture-b
+    }
+
+    print_output_summary() {
+        printf '%s (fixture output location)\n' "$1"
+    }
+
+    prompt_for_missing_arguments <<< $'invalid id\nPC-PROMPT\n9\n2' \
+        2> "$TEST_TMP/archive-setup-prompts.txt"
+    validate_arguments
+    [[ $PC_ID == PC-PROMPT ]] || fail "interactive prompt did not save the PC ID"
+    [[ $OUTPUT_PARENT == /mnt/fixture-b ]] || \
+        fail "interactive prompt did not save the output parent"
+    [[ $OUTPUT_ROOT == /mnt/fixture-b/PC-PROMPT ]] || \
+        fail "interactive prompt did not derive the PC working directory"
+)
+assert_file_contains "$TEST_TMP/archive-setup-prompts.txt" "Enter the PC ID"
+assert_file_contains "$TEST_TMP/archive-setup-prompts.txt" "[1] /mnt/fixture-a"
+assert_file_contains "$TEST_TMP/archive-setup-prompts.txt" "Enter an integer from 0 to 3."
+assert_file_contains "$TEST_TMP/archive-setup-prompts.txt" "Selected output parent: /mnt/fixture-b"
+
+(
+    source "$PROJECT_DIR/archive-disk.sh"
+
+    available_output_paths() {
+        printf '%s\n' /mnt/fixture-a
+    }
+
+    print_output_summary() {
+        printf '%s (fixture output location)\n' "$1"
+    }
+
+    prompt_for_output_parent <<< $'2\n/tmp/custom-output' 2>/dev/null
+    [[ $OUTPUT_PARENT == /tmp/custom-output ]] || \
+        fail "output picker did not accept a custom directory"
+)
+
 bash "$PROJECT_DIR/archive-disk.sh" \
     --pc-id PC-DOCS \
     --output "$TEST_TMP/documentation-dry-output" \
