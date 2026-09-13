@@ -93,7 +93,7 @@ The default keeps both the raw and compressed images. Add `--remove-raw-after-co
 
 ddrescue progress and errors are displayed live while also being saved under `ARCHIVE/logs/`. The retry pass first requests direct input I/O. If the device or operating system does not support it, the script records that failed attempt and automatically retries using buffered I/O. Compression output is also displayed live.
 
-SMART reports are written to `ARCHIVE/disks/smartctl-DEVICE.txt`. `smartctl` uses nonzero status bits for disk-health and error-history findings, so those findings are recorded as specific archive warnings rather than being mislabeled as collection failures. If a command returns no stderr, its stderr log explains that the useful output is in the corresponding report file.
+Extended SMART reports are written to `ARCHIVE/disks/smartctl-DEVICE.txt` using `smartctl -x`. If an extended command or checksum is incomplete, the script also runs `smartctl -a` and writes the standard report to `ARCHIVE/disks/smartctl-DEVICE.basic.txt`. The warning says whether that fallback collected a complete standard report. `smartctl` uses other nonzero status bits for disk-health and error-history findings, so those findings are recorded as specific archive warnings rather than being mislabeled as collection failures. The `ARCHIVE/livecd/tool-versions.txt` file contains only smartctl package and version information; it is not a drive report. If a command returns no stderr, its stderr log explains that the useful output is in the corresponding report file.
 
 `--all-internal-disks` selects all non-removable whole disks except the resolved output disk. Explicit `--target` selection is easier to audit and is recommended when only one disk is being archived.
 

@@ -210,6 +210,43 @@ jq --exit-status '.name == "collect_smartctl_sda" and .exit_code == 64' \
     "$TEST_TMP/smartctl-commands.jsonl" >/dev/null || \
     fail "smartctl command record did not retain its bitmask exit status"
 
+printf 'Checking smartctl standard-report fallback...\n'
+(
+    source "$PROJECT_DIR/archive-disk.sh"
+    COMMANDS_JSONL="$TEST_TMP/smartctl-fallback-commands.jsonl"
+    RECORD_ROOT="$TEST_TMP"
+
+    smartctl() {
+        if [[ $1 == -x ]]; then
+            printf 'Partial extended SMART report\n'
+            return 4
+        fi
+
+        printf 'Complete standard SMART report\n'
+        return 0
+    }
+
+    run_smartctl_collection \
+        collect_smartctl_sdb \
+        "$TEST_TMP/smartctl-sdb.txt" \
+        "$TEST_TMP/collect_smartctl-sdb.stderr.log" \
+        /dev/sdb \
+        2> "$TEST_TMP/smartctl-fallback-console.txt"
+)
+assert_file_contains "$TEST_TMP/smartctl-sdb.txt" "Partial extended SMART report"
+assert_file_contains "$TEST_TMP/smartctl-sdb.basic.txt" "Complete standard SMART report"
+assert_file_contains \
+    "$TEST_TMP/smartctl-fallback-console.txt" \
+    "smartctl -a fallback report was collected"
+jq --exit-status --slurp '
+    length == 2 and
+    .[0].name == "collect_smartctl_sdb" and
+    .[0].exit_code == 4 and
+    .[1].name == "collect_smartctl_sdb_basic" and
+    .[1].exit_code == 0
+' "$TEST_TMP/smartctl-fallback-commands.jsonl" >/dev/null || \
+    fail "smartctl fallback commands were not recorded correctly"
+
 if bash "$PROJECT_DIR/archive-disk.sh" \
     --pc-id PC-TEST \
     --output "$TEST_TMP/invalid-limit-output" \

@@ -866,6 +866,11 @@ run_smartctl_collection() {
     local stderr_file=$3
     local disk=$4
     local exit_code
+    local basic_exit_code=-1
+    local basic_stdout_file="${stdout_file%.txt}.basic.txt"
+    local basic_stderr_file="${stderr_file%.stderr.log}.basic.stderr.log"
+    local health_report_file=$stdout_file
+    local health_status
 
     if ! tool_is_available smartctl; then
         run_optional_command \
@@ -882,6 +887,42 @@ run_smartctl_collection() {
 
     add_missing_stderr_context "$exit_code" "$stdout_file" "$stderr_file"
 
+    health_status=$exit_code
+
+    if ((exit_code & 4)); then
+        log_warn \
+            "The extended smartctl -x report for $disk was incomplete;" \
+            "trying a standard smartctl -a report."
+
+        if run_recorded_command \
+            "${name}_basic" "$basic_stdout_file" "$basic_stderr_file" \
+            smartctl -a "$disk"; then
+            basic_exit_code=0
+        else
+            basic_exit_code=$?
+            add_missing_stderr_context \
+                "$basic_exit_code" "$basic_stdout_file" "$basic_stderr_file"
+        fi
+
+        health_status=$((exit_code | basic_exit_code))
+        if ((basic_exit_code & 248)); then
+            health_report_file=$basic_stdout_file
+        fi
+
+        if ((basic_exit_code & 7)); then
+            add_warning \
+                "smartctl -x could not collect every extended SMART item for $disk" \
+                "(exit status $exit_code), and the smartctl -a fallback also had" \
+                "collection errors (exit status $basic_exit_code);" \
+                "see $stdout_file, $basic_stdout_file, and their stderr logs."
+        else
+            add_warning \
+                "smartctl -x could not collect every extended SMART item for $disk" \
+                "(exit status $exit_code), but the smartctl -a fallback report was" \
+                "collected in $basic_stdout_file."
+        fi
+    fi
+
     if ((exit_code & 1)); then
         add_warning \
             "smartctl could not parse its command for $disk (exit status $exit_code);" \
@@ -892,29 +933,28 @@ run_smartctl_collection() {
             "smartctl could not open or identify $disk (exit status $exit_code);" \
             "see $stdout_file and $stderr_file"
     fi
-    if ((exit_code & 4)); then
-        add_warning \
-            "One or more SMART commands or checksums failed for $disk;" \
-            "the report in $stdout_file may be incomplete."
+    if ((health_status & 8)); then
+        add_warning "SMART reports that $disk is failing; review $health_report_file immediately."
     fi
-    if ((exit_code & 8)); then
-        add_warning "SMART reports that $disk is failing; review $stdout_file immediately."
-    fi
-    if ((exit_code & 16)); then
+    if ((health_status & 16)); then
         add_warning \
             "SMART reports a prefailure attribute at or below its threshold for $disk;" \
-            "review $stdout_file."
+            "review $health_report_file."
     fi
-    if ((exit_code & 32)); then
+    if ((health_status & 32)); then
         add_warning \
             "SMART reports that an attribute previously crossed its threshold for $disk;" \
-            "review $stdout_file."
+            "review $health_report_file."
     fi
-    if ((exit_code & 64)); then
-        add_warning "The SMART error log for $disk contains recorded errors; review $stdout_file."
+    if ((health_status & 64)); then
+        add_warning \
+            "The SMART error log for $disk contains recorded errors;" \
+            "review $health_report_file."
     fi
-    if ((exit_code & 128)); then
-        add_warning "The SMART self-test log for $disk contains errors; review $stdout_file."
+    if ((health_status & 128)); then
+        add_warning \
+            "The SMART self-test log for $disk contains errors;" \
+            "review $health_report_file."
     fi
 
     return 0
