@@ -30,17 +30,26 @@ sudo apt-get install --no-install-recommends \
   gddrescue jq zstd libguestfs-tools util-linux coreutils
 ```
 
-These optional packages improve the collected inventory:
+Windows registry and event-history extraction require two additional packages when Windows metadata is selected:
+
+```bash
+sudo apt-get install --no-install-recommends \
+  libhivex-bin libevtx-utils
+```
+
+These optional packages improve best-effort inventory collection:
 
 ```bash
 sudo apt-get install --no-install-recommends \
   smartmontools parted fdisk dmidecode lshw usbutils pciutils \
-  libhivex-bin libevtx-utils qemu-utils rpm
+  qemu-utils rpm
 ```
 
 Package names can differ between Debian releases. `archive-disk.sh` records optional tools as skipped instead of failing the disk image. `extract-metadata.sh` requires the libguestfs commands used for read-only inspection; Windows registry, event-log, RPM, and boot-history details remain best effort.
 
 Before a real archive run, `archive-disk.sh` checks the commands needed by the selected mode and the optional hardware-inventory commands. Missing required and optional apt packages are listed separately. The script prompts before installing either group, runs `apt-get` directly because archive runs are already root, and rechecks the commands after installation. Dry runs never install packages.
+
+`extract-metadata.sh` performs the same preflight before creating directories or mounting an image. Core libguestfs and parsing utilities are required, as are `libhivex-bin` and `libevtx-utils` whenever Windows extraction is enabled. Image-description and Linux package/history tools are offered as optional improvements. Declining or failing to install a required package stops extraction instead of creating incomplete primary metadata. Package installation uses `apt-get` directly because metadata extraction already requires root; dry runs do not install anything.
 
 ## Capture a disk
 

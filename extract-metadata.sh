@@ -37,6 +37,8 @@ WINDOWS_APPLICATION_COUNT=0
 LINUX_USER_COUNT=0
 LINUX_PACKAGE_COUNT=0
 declare -a WARNINGS=()
+declare -a MISSING_METADATA_REQUIRED_PACKAGES=()
+declare -a MISSING_METADATA_OPTIONAL_PACKAGES=()
 
 usage() {
     cat <<'EOF'
@@ -63,8 +65,12 @@ EOF
 }
 
 add_warning() {
-    WARNINGS+=("$*")
-    log_warn "$*"
+    local warning
+
+    printf -v warning '%s ' "$@"
+    warning=${warning% }
+    WARNINGS+=("$warning")
+    log_warn "$warning"
 }
 
 parse_arguments() {
@@ -156,6 +162,228 @@ validate_arguments() {
     fi
 }
 
+metadata_tool_is_available() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+add_missing_metadata_required_package() {
+    local package=$1
+    local existing_package
+
+    for existing_package in "${MISSING_METADATA_REQUIRED_PACKAGES[@]}"; do
+        [[ $existing_package == "$package" ]] && return 0
+    done
+    MISSING_METADATA_REQUIRED_PACKAGES+=("$package")
+}
+
+add_missing_metadata_optional_package() {
+    local package=$1
+    local existing_package
+
+    for existing_package in "${MISSING_METADATA_OPTIONAL_PACKAGES[@]}"; do
+        [[ $existing_package == "$package" ]] && return 0
+    done
+    MISSING_METADATA_OPTIONAL_PACKAGES+=("$package")
+}
+
+check_metadata_required_tool() {
+    local tool=$1
+    local package=$2
+
+    metadata_tool_is_available "$tool" || \
+        add_missing_metadata_required_package "$package"
+}
+
+check_metadata_optional_tool() {
+    local tool=$1
+    local package=$2
+
+    metadata_tool_is_available "$tool" || \
+        add_missing_metadata_optional_package "$package"
+}
+
+collect_missing_metadata_dependencies() {
+    MISSING_METADATA_REQUIRED_PACKAGES=()
+    MISSING_METADATA_OPTIONAL_PACKAGES=()
+
+    check_metadata_required_tool awk mawk
+    check_metadata_required_tool cat coreutils
+    check_metadata_required_tool date coreutils
+    check_metadata_required_tool df coreutils
+    check_metadata_required_tool find findutils
+    check_metadata_required_tool grep grep
+    check_metadata_required_tool head coreutils
+    check_metadata_required_tool jq jq
+    check_metadata_required_tool mktemp coreutils
+    check_metadata_required_tool mountpoint util-linux
+    check_metadata_required_tool realpath coreutils
+    check_metadata_required_tool sed sed
+    check_metadata_required_tool stat coreutils
+    check_metadata_required_tool tail coreutils
+    check_metadata_required_tool tr coreutils
+    check_metadata_required_tool wc coreutils
+    check_metadata_required_tool guestfish libguestfs-tools
+    check_metadata_required_tool guestmount libguestfs-tools
+    check_metadata_required_tool guestunmount libguestfs-tools
+
+    if [[ $IMAGE_PATH == *.img.zst && ! -f ${IMAGE_PATH%.zst} ]]; then
+        check_metadata_required_tool zstd zstd
+    fi
+    if [[ $EXTRACT_WINDOWS == true ]]; then
+        check_metadata_required_tool hivexregedit libhivex-bin
+        check_metadata_required_tool evtxexport libevtx-utils
+    fi
+
+    check_metadata_optional_tool qemu-img qemu-utils
+    check_metadata_optional_tool virt-filesystems libguestfs-tools
+    if [[ $EXTRACT_LINUX == true ]]; then
+        check_metadata_optional_tool journalctl systemd
+        check_metadata_optional_tool last wtmpdb
+        check_metadata_optional_tool rpm rpm
+    fi
+}
+
+print_metadata_package_list() {
+    local heading=$1
+    shift
+    local package
+
+    printf '%s\n' "$heading" >&2
+    for package in "$@"; do
+        printf '  - %s\n' "$package" >&2
+    done
+}
+
+prompt_metadata_yes_or_no() {
+    local question=$1
+    local default_answer=$2
+    local answer
+    local choices
+
+    if [[ $default_answer == yes ]]; then
+        choices='[Y/n]'
+    else
+        choices='[y/N]'
+    fi
+
+    while true; do
+        printf '%s %s ' "$question" "$choices" >&2
+        if ! read -r answer; then
+            return 1
+        fi
+        case ${answer,,} in
+            y|yes)
+                return 0
+                ;;
+            n|no)
+                return 1
+                ;;
+            '')
+                if [[ $default_answer == yes ]]; then
+                    return 0
+                fi
+                return 1
+                ;;
+            *)
+                printf 'Enter yes or no.\n' >&2
+                ;;
+        esac
+    done
+}
+
+install_metadata_packages_with_apt() {
+    local -a packages=("$@")
+
+    ((EUID == 0)) || die "Package installation must be run as root."
+    metadata_tool_is_available apt-get || \
+        die "Missing packages were found, but apt-get is not available."
+
+    printf 'Updating apt package indexes...\n' >&2
+    apt-get update || die "apt-get update failed."
+    printf 'Installing selected packages...\n' >&2
+    DEBIAN_FRONTEND=noninteractive \
+        apt-get install --yes --no-install-recommends "${packages[@]}" || \
+        die "apt-get could not install all selected packages."
+    hash -r
+}
+
+check_and_offer_metadata_dependencies() {
+    local install_optional=false
+    local install_required=false
+    local package
+    local -a packages_to_install=()
+    local -A queued_packages=()
+
+    collect_missing_metadata_dependencies
+    if ((${#MISSING_METADATA_REQUIRED_PACKAGES[@]} == 0 && \
+        ${#MISSING_METADATA_OPTIONAL_PACKAGES[@]} == 0)); then
+        printf 'All required and optional metadata tools are installed.\n' >&2
+        return 0
+    fi
+
+    if ((${#MISSING_METADATA_REQUIRED_PACKAGES[@]} > 0)); then
+        print_metadata_package_list \
+            'Missing packages required for the selected metadata mode:' \
+            "${MISSING_METADATA_REQUIRED_PACKAGES[@]}"
+        if prompt_metadata_yes_or_no \
+            'Install the missing required packages with apt?' yes; then
+            install_required=true
+        else
+            die "Required packages were declined; metadata extraction cannot continue."
+        fi
+    fi
+
+    if ((${#MISSING_METADATA_OPTIONAL_PACKAGES[@]} > 0)); then
+        print_metadata_package_list \
+            'Missing optional packages that improve metadata extraction:' \
+            "${MISSING_METADATA_OPTIONAL_PACKAGES[@]}"
+        if prompt_metadata_yes_or_no \
+            'Install the missing optional packages with apt?' no; then
+            install_optional=true
+        else
+            log_warn \
+                "Optional package installation was declined;" \
+                "related metadata will be skipped."
+        fi
+    fi
+
+    if [[ $install_required == true ]]; then
+        for package in "${MISSING_METADATA_REQUIRED_PACKAGES[@]}"; do
+            if [[ -z ${queued_packages[$package]+present} ]]; then
+                queued_packages[$package]=true
+                packages_to_install+=("$package")
+            fi
+        done
+    fi
+    if [[ $install_optional == true ]]; then
+        for package in "${MISSING_METADATA_OPTIONAL_PACKAGES[@]}"; do
+            if [[ -z ${queued_packages[$package]+present} ]]; then
+                queued_packages[$package]=true
+                packages_to_install+=("$package")
+            fi
+        done
+    fi
+
+    if ((${#packages_to_install[@]} > 0)); then
+        install_metadata_packages_with_apt "${packages_to_install[@]}"
+        collect_missing_metadata_dependencies
+    fi
+
+    if ((${#MISSING_METADATA_REQUIRED_PACKAGES[@]} > 0)); then
+        print_metadata_package_list \
+            'Required packages still missing after the dependency check:' \
+            "${MISSING_METADATA_REQUIRED_PACKAGES[@]}"
+        die "Required metadata tools are unavailable."
+    fi
+    if [[ $install_optional == true && \
+        ${#MISSING_METADATA_OPTIONAL_PACKAGES[@]} -gt 0 ]]; then
+        print_metadata_package_list \
+            'Optional packages still missing after installation:' \
+            "${MISSING_METADATA_OPTIONAL_PACKAGES[@]}"
+        log_warn "Some optional metadata tools remain unavailable."
+    fi
+}
+
 show_dry_run() {
     printf 'Dry-run metadata extraction plan\n'
     printf '  PC ID: %s\n' "$PC_ID"
@@ -192,6 +420,10 @@ validate_runtime() {
     require_tool mountpoint util-linux
     if [[ $IMAGE_PATH == *.img.zst && ! -f ${IMAGE_PATH%.zst} ]]; then
         require_tool zstd zstd
+    fi
+    if [[ $EXTRACT_WINDOWS == true ]]; then
+        require_tool hivexregedit libhivex-bin
+        require_tool evtxexport libevtx-utils
     fi
 }
 
@@ -914,16 +1146,33 @@ export_registry_key() {
     local key=$3
     local output_file=$4
     local max_depth=${5:--1}
+    local exit_code
 
     if ! command -v hivexregedit >/dev/null 2>&1; then
         record_skipped_command "$name" "$output_file" "$LOGS_DIR/$name.stderr.log" \
-            "Optional tool 'hivexregedit' is not installed; registry extraction was skipped."
+            "Required tool 'hivexregedit' is unexpectedly unavailable; registry extraction was skipped."
         return 1
     fi
 
-    run_recorded_command "$name" "$output_file" "$LOGS_DIR/$name.stderr.log" \
+    if run_recorded_command "$name" "$output_file" "$LOGS_DIR/$name.stderr.log" \
         hivexregedit --export --unsafe-printable-strings --max-depth "$max_depth" \
-        "$hive" "$key"
+        "$hive" "$key"; then
+        if [[ -s $output_file ]]; then
+            return 0
+        fi
+        add_warning \
+            "Registry export '$name' produced no data;" \
+            "Windows metadata may be incomplete."
+        return 1
+    else
+        exit_code=$?
+    fi
+
+    add_missing_stderr_context "$exit_code" "$output_file" "$LOGS_DIR/$name.stderr.log"
+    add_warning \
+        "Registry export '$name' failed with status $exit_code;" \
+        "see $LOGS_DIR/$name.stderr.log."
+    return 1
 }
 
 find_windows_path() {
@@ -1137,6 +1386,7 @@ extract_windows_network() {
 extract_windows_boot_history() {
     local root=$1
     local event_log
+    local exit_code
     local export_file="$SESSION_DIR/windows-system-evtx.txt"
     local summary_file="$METADATA_DIR/windows/boot-history.json"
 
@@ -1146,22 +1396,43 @@ extract_windows_boot_history() {
         return 0
     fi
 
-    if command -v evtxexport >/dev/null 2>&1; then
-        if run_recorded_command export_windows_system_events \
-            "$export_file" "$LOGS_DIR/evtxexport.stderr.log" \
-            evtxexport "$event_log"; then
-            grep -E -B 8 -A 12 'Event identifier[^0-9]*(6005|6009|12|41)([^0-9]|$)' \
-                "$export_file" > "$SESSION_DIR/windows-boot-events.txt" || true
-            jq --rawfile events "$SESSION_DIR/windows-boot-events.txt" --null-input '{
-                best_effort: true,
-                event_log_present: true,
-                parser: "evtxexport",
-                event_ids_requested: [6005, 6009, 12, 41],
-                summary: ($events | split("\n") | map(select(length > 0)))
-            }' > "$summary_file"
-            return 0
-        fi
+    if ! command -v evtxexport >/dev/null 2>&1; then
+        record_skipped_command \
+            export_windows_system_events \
+            "$export_file" \
+            "$LOGS_DIR/evtxexport.stderr.log" \
+            "Required tool 'evtxexport' is unexpectedly unavailable; Windows boot-history extraction was skipped."
+        jq --null-input '{
+            best_effort: true,
+            event_log_present: true,
+            parser: null,
+            events: [],
+            warning: "evtxexport is not installed; System.evtx was not parsed."
+        }' > "$summary_file"
+        add_warning \
+            "Required tool 'evtxexport' is unexpectedly unavailable;" \
+            "Windows boot-history extraction was skipped."
+        return 0
     fi
+
+    if run_recorded_command export_windows_system_events \
+        "$export_file" "$LOGS_DIR/evtxexport.stderr.log" \
+        evtxexport "$event_log"; then
+        grep -E -B 8 -A 12 'Event identifier[^0-9]*(6005|6009|12|41)([^0-9]|$)' \
+            "$export_file" > "$SESSION_DIR/windows-boot-events.txt" || true
+        jq --rawfile events "$SESSION_DIR/windows-boot-events.txt" --null-input '{
+            best_effort: true,
+            event_log_present: true,
+            parser: "evtxexport",
+            event_ids_requested: [6005, 6009, 12, 41],
+            summary: ($events | split("\n") | map(select(length > 0)))
+        }' > "$summary_file"
+        return 0
+    else
+        exit_code=$?
+    fi
+
+    add_missing_stderr_context "$exit_code" "$export_file" "$LOGS_DIR/evtxexport.stderr.log"
 
     jq --null-input '{
         best_effort: true,
@@ -1170,7 +1441,9 @@ extract_windows_boot_history() {
         events: [],
         warning: "System.evtx is present but libevtx-utils could not parse it."
     }' > "$summary_file"
-    add_warning "System.evtx is present but could not be parsed with evtxexport."
+    add_warning \
+        "System.evtx is present but evtxexport failed with status $exit_code;" \
+        "see $LOGS_DIR/evtxexport.stderr.log."
 }
 
 extract_windows_metadata() {
@@ -1587,6 +1860,8 @@ main() {
         exit 0
     fi
 
+    require_root
+    check_and_offer_metadata_dependencies
     validate_runtime
     register_cleanup_handler cleanup_metadata
     install_cleanup_trap

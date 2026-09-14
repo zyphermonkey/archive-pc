@@ -132,6 +132,44 @@ assert_file_contains "$TEST_TMP/dependency-prompts.txt" "Missing optional packag
 assert_file_contains "$TEST_TMP/requested-packages.txt" "gddrescue"
 assert_file_contains "$TEST_TMP/requested-packages.txt" "smartmontools"
 
+printf 'Checking metadata dependency installation prompts...\n'
+(
+    source "$PROJECT_DIR/extract-metadata.sh"
+    metadata_dependencies_installed=false
+
+    metadata_tool_is_available() {
+        case $1 in
+            guestfish|hivexregedit|evtxexport|qemu-img)
+                [[ $metadata_dependencies_installed == true ]]
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    }
+
+    install_metadata_packages_with_apt() {
+        printf '%s\n' "$@" > "$TEST_TMP/requested-metadata-packages.txt"
+        metadata_dependencies_installed=true
+    }
+
+    IMAGE_PATH="$TEST_TMP/fixture.img"
+    EXTRACT_WINDOWS=true
+    EXTRACT_LINUX=false
+    check_and_offer_metadata_dependencies <<< $'y\ny' \
+        2> "$TEST_TMP/metadata-dependency-prompts.txt"
+)
+assert_file_contains \
+    "$TEST_TMP/metadata-dependency-prompts.txt" \
+    "Missing packages required for the selected metadata mode"
+assert_file_contains \
+    "$TEST_TMP/metadata-dependency-prompts.txt" \
+    "Missing optional packages that improve metadata extraction"
+assert_file_contains "$TEST_TMP/requested-metadata-packages.txt" "libguestfs-tools"
+assert_file_contains "$TEST_TMP/requested-metadata-packages.txt" "libhivex-bin"
+assert_file_contains "$TEST_TMP/requested-metadata-packages.txt" "libevtx-utils"
+assert_file_contains "$TEST_TMP/requested-metadata-packages.txt" "qemu-utils"
+
 bash "$PROJECT_DIR/archive-disk.sh" \
     --pc-id PC-DOCS \
     --output "$TEST_TMP/documentation-dry-output" \
@@ -650,6 +688,10 @@ printf 'Checking the metadata workflow with read-only command doubles...\n'
     }
 
     require_tool() {
+        return 0
+    }
+
+    check_and_offer_metadata_dependencies() {
         return 0
     }
 
