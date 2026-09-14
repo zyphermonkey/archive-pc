@@ -405,6 +405,16 @@ if grep --fixed-strings --quiet "keep-out" "$TEST_TMP/redacted.txt"; then
 fi
 assert_file_contains "$TEST_TMP/redacted.txt" "address=192.0.2.10"
 
+cat > "$TEST_TMP/registry-values.reg" <<'EOF'
+[\Microsoft\Windows NT\CurrentVersion]
+"ProductName"=str(1):"Fixture Windows"
+"DisplayVersion"="legacy-format"
+EOF
+[[ $(registry_value "$TEST_TMP/registry-values.reg" ProductName) == "Fixture Windows" ]] || \
+    fail "registry value parser did not read hivex str(1) output"
+[[ $(registry_value "$TEST_TMP/registry-values.reg" DisplayVersion) == "legacy-format" ]] || \
+    fail "registry value parser did not retain legacy string compatibility"
+
 mkdir -p "$TEST_TMP/guest/etc/NetworkManager/system-connections"
 printf '%s\n' 'psk=a-different-secret' \
     > "$TEST_TMP/guest/etc/NetworkManager/system-connections/wifi.nmconnection"
@@ -425,9 +435,9 @@ fi
 
 cat > "$TEST_TMP/apps.reg" <<'EOF'
 [HKEY_LOCAL_MACHINE\Software\Fixture]
-"DisplayName"="Fixture App"
-"DisplayVersion"="9.0"
-"Publisher"="Fixture Publisher"
+"DisplayName"=str(1):"Fixture App"
+"DisplayVersion"=str(1):"9.0"
+"Publisher"=str(1):"Fixture Publisher"
 EOF
 : > "$TEST_TMP/apps.tsv"
 parse_windows_applications \
@@ -437,12 +447,14 @@ parse_windows_applications \
 jq --exit-status '
     length == 1
     and .[0].display_name == "Fixture App"
+    and .[0].display_version == "9.0"
+    and .[0].publisher == "Fixture Publisher"
 ' "$METADATA_DIR/windows/applications.json" >/dev/null || \
     fail "Windows application parser returned unexpected data"
 
 cat > "$TEST_TMP/profiles.reg" <<'EOF'
 [HKEY_LOCAL_MACHINE\Software\ProfileList\S-1-5-21-1000]
-"ProfileImagePath"="C:\\Users\\Alice"
+"ProfileImagePath"=str(2):"C:\\Users\\Alice"
 EOF
 extract_windows_profiles "$TEST_TMP/guest" "$TEST_TMP/profiles.reg"
 jq --exit-status '

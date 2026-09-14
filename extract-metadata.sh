@@ -1125,7 +1125,9 @@ registry_value() {
     local value_name=$2
 
     [[ -f $export_file ]] || return 0
-    sed -nE "s/^\"${value_name}\"=\"(.*)\"$/\\1/p" "$export_file" | head -n 1
+    sed -nE \
+        "s/^\"${value_name}\"=(str\\([12]\\):)?\"(.*)\"$/\\2/p" \
+        "$export_file" | head -n 1
 }
 
 registry_dword() {
@@ -1200,6 +1202,7 @@ parse_windows_applications() {
         }
         function clean_value(line) {
             sub(/^[^=]*=/, "", line)
+            sub(/^str\([12]\):/, "", line)
             if (line ~ /^".*"$/) {
                 sub(/^"/, "", line)
                 sub(/"$/, "", line)
@@ -1260,6 +1263,7 @@ parse_registry_profiles() {
     awk '
         function clean_value(line) {
             sub(/^[^=]*=/, "", line)
+            sub(/^str\([12]\):/, "", line)
             if (line ~ /^".*"$/) {
                 sub(/^"/, "", line)
                 sub(/"$/, "", line)
@@ -1368,7 +1372,11 @@ extract_windows_network() {
                 --arg name "$value_name" \
                 --arg value "$value" \
                 '{name: $name, value: $value}' >> "$records"
-        done < <(sed -nE "s/^\"${value_name}\"=\"(.*)\"$/\\1/p" "$tcpip_export" 2>/dev/null || true)
+        done < <(
+            sed -nE \
+                "s/^\"${value_name}\"=(str\\([12]\\):)?\"(.*)\"$/\\2/p" \
+                "$tcpip_export" 2>/dev/null || true
+        )
     done
 
     jq --null-input \
