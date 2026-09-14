@@ -22,7 +22,10 @@ LOGS_DIR=""
 MOUNT_DATA_DIR=""
 ACTIVE_IMAGE=""
 ACTIVE_MOUNT=""
+ACTIVE_MOUNT_PID=""
 ACTIVE_MOUNT_PID_FILE=""
+GUESTMOUNT_EXIT_TIMEOUT_SECONDS=60
+GUESTMOUNT_WAIT_TIMED_OUT=false
 TEMPORARY_IMAGE=""
 STARTED_AT=""
 STARTED_EPOCH=0
@@ -222,16 +225,25 @@ The structured files in the parent directory are derived from read-only access t
 EOF
 }
 
-wait_for_guestmount_exit() {
+read_guestmount_pid() {
     local pid_file=$1
     local guestmount_pid
-    local remaining=10
 
-    [[ -f $pid_file ]] || return 0
     guestmount_pid=$(cat -- "$pid_file" 2>/dev/null || true)
-    if [[ ! $guestmount_pid =~ ^[0-9]+$ ]]; then
-        rm -- "$pid_file"
-        return 0
+    [[ $guestmount_pid =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$guestmount_pid"
+}
+
+wait_for_guestmount_exit() {
+    local guestmount_pid=$1
+    local remaining=$GUESTMOUNT_EXIT_TIMEOUT_SECONDS
+
+    [[ $guestmount_pid =~ ^[0-9]+$ ]] || return 1
+
+    if kill -0 "$guestmount_pid" 2>/dev/null; then
+        log_info \
+            "Waiting for guestmount process $guestmount_pid to finish cleanup" \
+            "(up to $GUESTMOUNT_EXIT_TIMEOUT_SECONDS seconds)."
     fi
 
     while kill -0 "$guestmount_pid" 2>/dev/null && ((remaining > 0)); do
@@ -240,17 +252,29 @@ wait_for_guestmount_exit() {
     done
 
     if kill -0 "$guestmount_pid" 2>/dev/null; then
-        log_warn "guestmount process $guestmount_pid did not exit within 10 seconds."
+        log_warn \
+            "guestmount process $guestmount_pid did not exit within" \
+            "$GUESTMOUNT_EXIT_TIMEOUT_SECONDS seconds."
+        GUESTMOUNT_WAIT_TIMED_OUT=true
         return 1
     fi
-
-    rm -- "$pid_file"
 }
 
 cleanup_metadata() {
     local cleanup_status=0
+    local mount_was_active=false
+
+    if [[ -z $ACTIVE_MOUNT_PID && -n $ACTIVE_MOUNT_PID_FILE ]]; then
+        ACTIVE_MOUNT_PID=$(read_guestmount_pid "$ACTIVE_MOUNT_PID_FILE" || true)
+    fi
+
+    if [[ $GUESTMOUNT_WAIT_TIMED_OUT == true ]]; then
+        log_error "Leaving work files in place because guestmount may still be using the image."
+        return 1
+    fi
 
     if [[ -n $ACTIVE_MOUNT && -d $ACTIVE_MOUNT ]] && mountpoint --quiet "$ACTIVE_MOUNT"; then
+        mount_was_active=true
         if command -v guestunmount >/dev/null 2>&1; then
             guestunmount "$ACTIVE_MOUNT" >/dev/null 2>&1 || cleanup_status=1
         else
@@ -258,11 +282,19 @@ cleanup_metadata() {
         fi
     fi
 
-    if [[ -n $ACTIVE_MOUNT_PID_FILE ]]; then
-        if ! wait_for_guestmount_exit "$ACTIVE_MOUNT_PID_FILE"; then
+    if [[ -n $ACTIVE_MOUNT_PID ]]; then
+        if ! wait_for_guestmount_exit "$ACTIVE_MOUNT_PID"; then
             log_error "Leaving work files in place because guestmount may still be using the image."
             return 1
         fi
+    elif [[ $mount_was_active == true ]]; then
+        log_error \
+            "Leaving work files in place because the guestmount worker PID was unavailable."
+        return 1
+    fi
+
+    if [[ -n $ACTIVE_MOUNT_PID_FILE ]]; then
+        rm -f -- "$ACTIVE_MOUNT_PID_FILE"
     fi
 
     if [[ -n $ACTIVE_MOUNT && -d $ACTIVE_MOUNT ]] && mountpoint --quiet "$ACTIVE_MOUNT"; then
@@ -846,7 +878,7 @@ extract_linux_metadata() {
     local root=$1
     local device=$2
 
-    log_info "Extracting Linux metadata from $device."
+    log_info "Extracting Linux metadata from image filesystem $device."
     extract_linux_os "$root" "$device"
     extract_linux_users_and_groups "$root"
     extract_linux_packages "$root"
@@ -1165,7 +1197,7 @@ extract_windows_metadata() {
     local control_set_number=1
     local control_set="ControlSet001"
 
-    log_info "Extracting Windows metadata from $device."
+    log_info "Extracting Windows metadata from image filesystem $device."
     software_hive=$(find_windows_path "$root" 'Windows/System32/config/SOFTWARE' 2>/dev/null || true)
     system_hive=$(find_windows_path "$root" 'Windows/System32/config/SYSTEM' 2>/dev/null || true)
     : > "$applications_tsv"
@@ -1297,6 +1329,8 @@ inspect_filesystems() {
         safe_device=$(basename -- "$device" | tr -c 'A-Za-z0-9._-' '_')
         mount_dir="$SESSION_DIR/mount-$safe_device"
         ACTIVE_MOUNT_PID_FILE="$SESSION_DIR/guestmount-$safe_device.pid"
+        ACTIVE_MOUNT_PID=""
+        GUESTMOUNT_WAIT_TIMED_OUT=false
         mkdir -p -- "$mount_dir"
         ACTIVE_MOUNT=$mount_dir
 
@@ -1304,16 +1338,21 @@ inspect_filesystems() {
             "$LOGS_DIR/guestmount-$safe_device.log" "$LOGS_DIR/guestmount-$safe_device.stderr.log" \
             guestmount --format=raw --add "$ACTIVE_IMAGE" --mount "$device" --ro \
                 --pid-file "$ACTIVE_MOUNT_PID_FILE" "$mount_dir"; then
-            printf '%s mounted %s (%s) read-only at %s\n' \
+            ACTIVE_MOUNT_PID=$(read_guestmount_pid "$ACTIVE_MOUNT_PID_FILE") || \
+                die "guestmount did not record its worker PID for image filesystem $device."
+            printf '%s mounted image filesystem %s (%s) read-only at %s\n' \
                 "$(record_time_now)" "$device" "$filesystem" "$mount_dir" \
                 >> "$MOUNT_DATA_DIR/mount-report.txt"
             inspect_mounted_filesystem "$mount_dir" "$device" "$safe_device"
         else
             mount_status=$?
-            printf '%s failed to mount %s (%s), exit %s\n' \
+            ACTIVE_MOUNT_PID=$(read_guestmount_pid "$ACTIVE_MOUNT_PID_FILE" || true)
+            printf '%s failed to mount image filesystem %s (%s), exit %s\n' \
                 "$(record_time_now)" "$device" "$filesystem" "$mount_status" \
                 >> "$MOUNT_DATA_DIR/mount-report.txt"
-            add_warning "Could not mount $device read-only; metadata on it was not inspected."
+            add_warning \
+                "Could not mount image filesystem $device read-only;" \
+                "metadata on it was not inspected."
         fi
 
         if mountpoint --quiet "$mount_dir"; then
@@ -1321,9 +1360,15 @@ inspect_filesystems() {
                 "$LOGS_DIR/guestunmount-$safe_device.log" "$LOGS_DIR/guestunmount-$safe_device.stderr.log" \
                 guestunmount "$mount_dir" || die "Could not unmount $mount_dir."
         fi
-        wait_for_guestmount_exit "$ACTIVE_MOUNT_PID_FILE" || \
-            die "guestmount did not finish cleanup for $device."
+        if [[ -n $ACTIVE_MOUNT_PID ]]; then
+            wait_for_guestmount_exit "$ACTIVE_MOUNT_PID" || \
+                die \
+                    "guestmount did not finish cleanup for image filesystem" \
+                    "$device from $ACTIVE_IMAGE."
+        fi
+        rm -f -- "$ACTIVE_MOUNT_PID_FILE"
         ACTIVE_MOUNT=""
+        ACTIVE_MOUNT_PID=""
         ACTIVE_MOUNT_PID_FILE=""
         rmdir -- "$mount_dir" 2>/dev/null || true
     done < "$MOUNT_DATA_DIR/filesystems.txt"
@@ -1554,6 +1599,7 @@ main() {
     fi
     log_info "Metadata extraction started for $PC_ID."
     prepare_active_image
+    log_info "Inspecting selected image: $ACTIVE_IMAGE"
     collect_image_information
     write_partitions_json
     inspect_filesystems

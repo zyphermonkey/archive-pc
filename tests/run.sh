@@ -653,13 +653,29 @@ printf 'Checking the metadata workflow with read-only command doubles...\n'
         return 0
     }
 
+    fixture_mount_is_active=false
+
+    mountpoint() {
+        [[ $fixture_mount_is_active == true ]]
+    }
+
     guestfish() {
         printf '/dev/sda1: ext4\n'
     }
 
     guestmount() {
+        local argument
         local mount_dir=${@: -1}
+        local previous_argument=""
 
+        for argument in "$@"; do
+            if [[ $previous_argument == --pid-file ]]; then
+                printf '%s\n' 999999999 > "$argument"
+            fi
+            previous_argument=$argument
+        done
+
+        fixture_mount_is_active=true
         mkdir -p "$mount_dir/etc" "$mount_dir/var/lib/dpkg"
         printf '%s\n' 'NAME="Workflow Linux"' 'VERSION_ID="1"' \
             > "$mount_dir/etc/os-release"
@@ -677,6 +693,9 @@ printf 'Checking the metadata workflow with read-only command doubles...\n'
     }
 
     guestunmount() {
+        # Reproduce guestmount removing its PID file during shutdown.
+        fixture_mount_is_active=false
+        rm -f -- "$ACTIVE_MOUNT_PID_FILE"
         return 0
     }
 
@@ -695,6 +714,12 @@ jq --exit-status '
     and .extraction.linux.packages == 1
 ' "$TEST_TMP/workflow-output/METADATA/PC-WORKFLOW.metadata.json" >/dev/null || \
     fail "metadata workflow summary returned unexpected data"
+assert_file_contains \
+    "$TEST_TMP/workflow-output/METADATA/logs/extract-metadata.log" \
+    "Inspecting selected image: $TEST_TMP/fixture.img"
+assert_file_contains \
+    "$TEST_TMP/workflow-output/METADATA/logs/extract-metadata.log" \
+    "image filesystem /dev/sda1"
 if find "$TEST_TMP/workflow-output/METADATA/work" \
     -maxdepth 1 -type d -name 'session.*' -print -quit | grep --quiet .; then
     fail "metadata workflow retained a temporary session directory"

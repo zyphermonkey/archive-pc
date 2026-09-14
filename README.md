@@ -16,6 +16,8 @@ The acquisition script accepts only whole block devices, excludes the physical d
 
 The metadata script uses `guestfish` and `guestmount --ro`. It never runs filesystem repair tools. Paths read from a mounted guest must resolve beneath that mount, preventing a guest symlink from redirecting collection into the live system. `/etc/shadow` and Windows SAM password hashes are never collected. Network secrets are redacted by default.
 
+Names such as `/dev/sda1` reported during metadata extraction belong to libguestfs's isolated virtual appliance. They identify partitions or logical volumes inside the image supplied with `--image`; they are not host devices opened by the script. The selected image path is shown in the extraction log before filesystem inspection begins.
+
 Disk imaging is inherently consequential. Review the selected source and destination carefully, keep the source as idle as possible, and use stable device paths such as `/dev/disk/by-id/...` when available.
 
 ## Live environment dependencies
