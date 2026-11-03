@@ -4,6 +4,7 @@
 
 The workflow is deliberately split:
 
+- [`extract-hostname.sh`](extract-hostname.sh) quickly looks up the hostname on a physical disk before imaging, so it can be used as the archive PC ID.
 - [`archive-disk.sh`](archive-disk.sh) reads a physical disk with GNU ddrescue, hashes and optionally compresses the image, and records how the archive was created.
 - [`extract-metadata.sh`](extract-metadata.sh) inspects an existing raw or zstd-compressed image through read-only libguestfs mounts and creates Windows and Linux inventory reports.
 - [`lib/common.sh`](lib/common.sh) provides shared logging, command recording, cleanup, JSON, and managed-README helpers.
@@ -50,6 +51,53 @@ Package names can differ between Debian releases. `archive-disk.sh` records opti
 Before a real archive run, `archive-disk.sh` checks the commands needed by the selected mode and the optional hardware-inventory commands. Missing required and optional apt packages are listed separately. The script prompts before installing either group, runs `apt-get` directly because archive runs are already root, and rechecks the commands after installation. Dry runs never install packages.
 
 `extract-metadata.sh` performs the same preflight before creating directories or mounting an image. Core libguestfs and parsing utilities are required, as are `libhivex-bin` and `libevtx-utils` whenever Windows extraction is enabled. Image-description and Linux package/history tools are offered as optional improvements. Declining or failing to install a required package stops extraction instead of creating incomplete primary metadata. Package installation uses `apt-get` directly because metadata extraction already requires root; dry runs do not install anything.
+
+## Look up the hostname before archiving
+
+From your live environment's root shell, run:
+
+```bash
+./extract-hostname.sh
+```
+
+Select a whole disk from the numbered list, or provide one explicitly:
+
+```bash
+./extract-hostname.sh --target /dev/disk/by-id/ata-example
+```
+
+The script opens that disk read-only in one libguestfs appliance and uses
+guestfish's built-in OS inspection to find Windows or Linux hostnames. It
+creates no image and collects no application inventory. Appliance startup
+and limited OS inspection take time; the first run can be slower while
+libguestfs builds its appliance cache. No host filesystem or FUSE mounts
+are created, so this lookup does not use guestmount PID-file cleanup.
+
+Only the hostname is printed to stdout; prompts, package installation, and
+diagnostics go to stderr. To pass it directly to the archive script, use the
+same source disk in both commands:
+
+```bash
+source_disk=/dev/disk/by-id/ata-example
+pc_id=$(./extract-hostname.sh --target "$source_disk") &&
+  ./archive-disk.sh --target "$source_disk" --pc-id "$pc_id" --output /mnt/archive
+```
+
+If several installations have different usable hostnames, the script asks
+which one to use. Installations with unknown or unavailable names are skipped
+with a warning; if no usable names remain, lookup fails with no hostname on stdout.
+Names must meet the archive PC ID rules (letters, numbers, dots, underscores,
+or hyphens, starting with a letter or number); names are never silently
+changed. Lookup or session-cleanup failures return nonzero, preventing the
+`&&` command from starting an archive.
+
+Missing required packages (`libguestfs-tools`, `util-linux`, or `coreutils`)
+are offered for installation with `apt-get`, then checked again before disk
+access. Windows hostname inspection uses libguestfs's internal registry
+reader, so this script does not need `hivexregedit` or `evtxexport`.
+Encrypted or unsupported installations may not yield a hostname. Use this
+lookup on idle, healthy source disks; it does not repair filesystems or
+unlock encryption. Add `--debug` for diagnostic details.
 
 ## Capture a disk
 
@@ -196,5 +244,5 @@ Run the self-contained fixture tests with:
 If ShellCheck is installed, also run:
 
 ```bash
-shellcheck archive-disk.sh extract-metadata.sh lib/common.sh tests/run.sh
+shellcheck archive-disk.sh extract-metadata.sh extract-hostname.sh lib/common.sh tests/run.sh tests/hostname.sh
 ```

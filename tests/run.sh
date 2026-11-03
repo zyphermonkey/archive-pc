@@ -28,7 +28,11 @@ printf 'Checking Bash syntax...\n'
 bash -n \
     "$PROJECT_DIR/archive-disk.sh" \
     "$PROJECT_DIR/extract-metadata.sh" \
+    "$PROJECT_DIR/extract-hostname.sh" \
+    "$PROJECT_DIR/tests/hostname.sh" \
     "$PROJECT_DIR/lib/common.sh"
+
+bash "$PROJECT_DIR/tests/hostname.sh"
 
 printf 'Checking help and dry-run behavior...\n'
 bash "$PROJECT_DIR/archive-disk.sh" --help >/dev/null
